@@ -69,25 +69,57 @@ jobs:
         run: ./scripts/prepare-ios-dependencies.sh
 
       - name: Build MPVKit iOS frameworks
+        shell: bash
         run: |
-          make -C MPVKit build platform=ios
-          test -d "MPVKit/dist/release/xcframework/Libmpv.xcframework"
-          test -d "MPVKit/dist/release/xcframework/Libavcodec.xcframework"
-          test -d "MPVKit/dist/release/xcframework/Libavfilter.xcframework"
-          test -d "MPVKit/dist/release/xcframework/Libplacebo.xcframework"
+          set -o pipefail
+          mkdir -p build
+
+          if ! make -C MPVKit build platform=ios 2>&1 | tee build/mpvkit-build.log; then
+            echo "::group::MPVKit error context"
+            grep -n -i -C 8 -E 'error:|fatal:|failed|failure|exit code' \
+              build/mpvkit-build.log | tail -n 160 || true
+            echo "::endgroup::"
+            exit 1
+          fi
+
+          for name in Libmpv Libavcodec Libavdevice Libavformat Libavfilter \
+                      Libavutil Libswresample Libswscale Libplacebo; do
+            framework="MPVKit/dist/release/xcframework/${name}.xcframework"
+            if [[ ! -f "${framework}/Info.plist" ]]; then
+              echo "Missing or incomplete ${framework}" >&2
+              exit 1
+            fi
+          done
+
+      - name: Upload MPVKit build log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: mpvkit-build-log-${{ github.sha }}
+          path: build/mpvkit-build.log
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Fix Tuvora app path in packaging script
         run: |
           python3 - <<'PY'
           from pathlib import Path
-          p = Path("scripts/build-ios-ipa.sh")
-          text = p.read_text()
+
+          path = Path("scripts/build-ios-ipa.sh")
+          contents = path.read_text()
+
           old = 'app_path="${derived_data}/Build/Products/${configuration}-iphoneos/Nuvio.app"'
           new = 'app_path="${derived_data}/Build/Products/${configuration}-iphoneos/Tuvora.app"'
-          if old not in text:
-              raise SystemExit("Expected Nuvio.app path not found in scripts/build-ios-ipa.sh")
-          p.write_text(text.replace(old, new))
-          print("Patched build-ios-ipa.sh for Tuvora.app")
+
+          if old in contents:
+              path.write_text(contents.replace(old, new))
+              print("Updated packaging path to Tuvora.app")
+          elif new in contents:
+              print("Packaging path already points to Tuvora.app")
+          else:
+              raise SystemExit(
+                  "Could not find the expected app_path in scripts/build-ios-ipa.sh"
+              )
           PY
 
       - name: Build unsigned full ${{ inputs.configuration }} IPA
@@ -109,6 +141,7 @@ jobs:
         run: |
           configuration_slug="$(printf '%s' "${IOS_CONFIGURATION}" | tr '[:upper:]' '[:lower:]')"
           ipa_path="$(find build/ios-ipa -maxdepth 1 -type f -name "*-full-${configuration_slug}.ipa" -print -quit)"
+
           if [[ -z "${ipa_path}" ]]; then
             echo "No IPA was produced." >&2
             exit 1
