@@ -1,6 +1,11 @@
 #!/bin/sh
 set -eu
 
+if [ "${NUVIO_SKIP_POSTHOG_DSYM_UPLOAD:-0}" = "1" ]; then
+  echo "Skipping PostHog dSYM upload."
+  exit 0
+fi
+
 if [ "${CONFIGURATION:-}" != "Release" ]; then
   exit 0
 fi
