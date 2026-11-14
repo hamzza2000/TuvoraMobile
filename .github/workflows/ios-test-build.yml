@@ -83,10 +83,12 @@ jobs:
           fi
 
           xcframework_dir="MPVKit/dist/release/xcframework"
+          release_dir="MPVKit/dist/release"
           mkdir -p "${xcframework_dir}"
 
+          # Unpack frameworks MPVKit built and packaged.
           shopt -s nullglob
-          archives=(MPVKit/dist/release/*.xcframework.zip)
+          archives=("${release_dir}"/*.xcframework.zip)
           if [[ ${#archives[@]} -eq 0 ]]; then
             echo "MPVKit produced no XCFramework ZIP archives." >&2
             exit 1
@@ -96,6 +98,40 @@ jobs:
             echo "Unpacking ${archive}"
             unzip -q -o "${archive}" -d "${xcframework_dir}"
           done
+
+          # MPVKit declares Libplacebo as a local binary target, but does not
+          # produce its XCFramework ZIP in this build. Fetch its matching release.
+          placebo_version="7.360.1"
+          placebo_url="https://github.com/mpvkit/libplacebo-build/releases/download/${placebo_version}/Libplacebo.xcframework.zip"
+          placebo_checksum_url="https://github.com/mpvkit/libplacebo-build/releases/download/${placebo_version}/Libplacebo.xcframework.checksum.txt"
+          placebo_zip="${RUNNER_TEMP}/Libplacebo.xcframework.zip"
+          placebo_checksum="${RUNNER_TEMP}/Libplacebo.xcframework.checksum.txt"
+          placebo_extract="${RUNNER_TEMP}/libplacebo-extract"
+
+          curl --fail --location --retry 5 --retry-all-errors \
+            --output "${placebo_zip}" "${placebo_url}"
+          curl --fail --location --retry 5 --retry-all-errors \
+            --output "${placebo_checksum}" "${placebo_checksum_url}"
+
+          expected_checksum="$(tr -d '[:space:]' < "${placebo_checksum}")"
+          actual_checksum="$(swift package compute-checksum "${placebo_zip}")"
+          if [[ "${actual_checksum}" != "${expected_checksum}" ]]; then
+            echo "Libplacebo XCFramework checksum mismatch." >&2
+            exit 1
+          fi
+
+          mkdir -p "${placebo_extract}"
+          unzip -q -o "${placebo_zip}" -d "${placebo_extract}"
+          placebo_framework="$(find "${placebo_extract}" -type d \
+            -name 'Libplacebo.xcframework' -print -quit)"
+
+          if [[ -z "${placebo_framework}" || ! -f "${placebo_framework}/Info.plist" ]]; then
+            echo "The Libplacebo release archive did not contain a valid XCFramework." >&2
+            exit 1
+          fi
+
+          ditto "${placebo_framework}" \
+            "${xcframework_dir}/Libplacebo.xcframework"
 
           for name in Libmpv Libavcodec Libavdevice Libavformat Libavfilter \
                       Libavutil Libswresample Libswscale Libplacebo; do
