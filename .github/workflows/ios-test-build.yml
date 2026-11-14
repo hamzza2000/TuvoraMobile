@@ -65,6 +65,9 @@ jobs:
           printf '%s' "${RELEASE_PROPERTIES_BASE64}" | base64 --decode > local.properties
           sed -i '' -E '/^[[:space:]]*(sdk\.dir|NUVIO_RELEASE_STORE_FILE)[[:space:]]*=/d' local.properties
 
+      - name: Ensure local.properties exists
+        run: touch local.properties
+
       - name: Prepare iOS dependencies
         run: ./scripts/prepare-ios-dependencies.sh
 
@@ -86,7 +89,7 @@ jobs:
           release_dir="MPVKit/dist/release"
           mkdir -p "${xcframework_dir}"
 
-          # Unpack frameworks MPVKit built and packaged.
+          # Unpack the XCFramework archives produced by MPVKit.
           shopt -s nullglob
           archives=("${release_dir}"/*.xcframework.zip)
           if [[ ${#archives[@]} -eq 0 ]]; then
@@ -99,8 +102,8 @@ jobs:
             unzip -q -o "${archive}" -d "${xcframework_dir}"
           done
 
-          # MPVKit declares Libplacebo as a local binary target, but does not
-          # produce its XCFramework ZIP in this build. Fetch its matching release.
+          # Libplacebo is a local binary target in MPVKit's Package.swift, but
+          # its XCFramework is distributed by libplacebo-build.
           placebo_version="7.360.1"
           placebo_url="https://github.com/mpvkit/libplacebo-build/releases/download/${placebo_version}/Libplacebo.xcframework.zip"
           placebo_checksum_url="https://github.com/mpvkit/libplacebo-build/releases/download/${placebo_version}/Libplacebo.xcframework.checksum.txt"
@@ -126,7 +129,7 @@ jobs:
             -name 'Libplacebo.xcframework' -print -quit)"
 
           if [[ -z "${placebo_framework}" || ! -f "${placebo_framework}/Info.plist" ]]; then
-            echo "The Libplacebo release archive did not contain a valid XCFramework." >&2
+            echo "Libplacebo release archive did not contain a valid XCFramework." >&2
             exit 1
           fi
 
@@ -177,7 +180,7 @@ jobs:
         run: |
           (
             while sleep 60; do
-              echo "::group::Build resources $(date -u '+%Y-%m:%M:%SZ')"
+              echo "::group::Build resources $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
               uptime
               vm_stat
               ps -Ao pid,etime,%cpu,rss,command -r | head -n 12 || true
@@ -190,8 +193,9 @@ jobs:
 
       - name: Summarize IPA
         run: |
-          configuration_slug="$(printf '%s' "${IOS_CONFIGURATION}" | tr '[:upper:]' '[:upper:]')"
-          ipa_path="$(find build/ios-ipa -maxdepth 1 -type f -name "*-full-${configuration_slug}.ipa" -print -quit)"
+          configuration_slug="$(printf '%s' "${IOS_CONFIGURATION}" | tr '[:upper:]' '[:lower:]')"
+          ipa_path="$(find build/ios-ipa -maxdepth 1 -type f \
+            -name "*-full-${configuration_slug}.ipa" -print -quit)"
 
           if [[ -z "${ipa_path}" ]]; then
             echo "No IPA was produced." >&2
