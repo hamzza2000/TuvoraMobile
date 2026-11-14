@@ -71,7 +71,7 @@ jobs:
       - name: Build MPVKit iOS frameworks
         shell: bash
         run: |
-          set -o pipefail
+          set -euo pipefail
           mkdir -p build
 
           if ! make -C MPVKit build platform=ios 2>&1 | tee build/mpvkit-build.log; then
@@ -82,9 +82,24 @@ jobs:
             exit 1
           fi
 
+          xcframework_dir="MPVKit/dist/release/xcframework"
+          mkdir -p "${xcframework_dir}"
+
+          shopt -s nullglob
+          archives=(MPVKit/dist/release/*.xcframework.zip)
+          if [[ ${#archives[@]} -eq 0 ]]; then
+            echo "MPVKit produced no XCFramework ZIP archives." >&2
+            exit 1
+          fi
+
+          for archive in "${archives[@]}"; do
+            echo "Unpacking ${archive}"
+            unzip -q -o "${archive}" -d "${xcframework_dir}"
+          done
+
           for name in Libmpv Libavcodec Libavdevice Libavformat Libavfilter \
                       Libavutil Libswresample Libswscale Libplacebo; do
-            framework="MPVKit/dist/release/xcframework/${name}.xcframework"
+            framework="${xcframework_dir}/${name}.xcframework"
             if [[ ! -f "${framework}/Info.plist" ]]; then
               echo "Missing or incomplete ${framework}" >&2
               exit 1
@@ -126,7 +141,7 @@ jobs:
         run: |
           (
             while sleep 60; do
-              echo "::group::Build resources $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+              echo "::group::Build resources $(date -u '+%Y-%m:%M:%SZ')"
               uptime
               vm_stat
               ps -Ao pid,etime,%cpu,rss,command -r | head -n 12 || true
@@ -139,7 +154,7 @@ jobs:
 
       - name: Summarize IPA
         run: |
-          configuration_slug="$(printf '%s' "${IOS_CONFIGURATION}" | tr '[:upper:]' '[:lower:]')"
+          configuration_slug="$(printf '%s' "${IOS_CONFIGURATION}" | tr '[:upper:]' '[:upper:]')"
           ipa_path="$(find build/ios-ipa -maxdepth 1 -type f -name "*-full-${configuration_slug}.ipa" -print -quit)"
 
           if [[ -z "${ipa_path}" ]]; then
