@@ -68,6 +68,28 @@ jobs:
       - name: Prepare iOS dependencies
         run: ./scripts/prepare-ios-dependencies.sh
 
+      - name: Build MPVKit iOS frameworks
+        run: |
+          make -C MPVKit build platform=ios
+          test -d "MPVKit/dist/release/xcframework/Libmpv.xcframework"
+          test -d "MPVKit/dist/release/xcframework/Libavcodec.xcframework"
+          test -d "MPVKit/dist/release/xcframework/Libavfilter.xcframework"
+          test -d "MPVKit/dist/release/xcframework/Libplacebo.xcframework"
+
+      - name: Fix Tuvora app path in packaging script
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("scripts/build-ios-ipa.sh")
+          text = p.read_text()
+          old = 'app_path="${derived_data}/Build/Products/${configuration}-iphoneos/Nuvio.app"'
+          new = 'app_path="${derived_data}/Build/Products/${configuration}-iphoneos/Tuvora.app"'
+          if old not in text:
+              raise SystemExit("Expected Nuvio.app path not found in scripts/build-ios-ipa.sh")
+          p.write_text(text.replace(old, new))
+          print("Patched build-ios-ipa.sh for Tuvora.app")
+          PY
+
       - name: Build unsigned full ${{ inputs.configuration }} IPA
         run: |
           (
