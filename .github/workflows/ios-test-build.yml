@@ -17,7 +17,7 @@ permissions:
 
 concurrency:
   group: ios-test-build-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -68,28 +68,6 @@ jobs:
 
       - name: Ensure local.properties exists
         run: touch local.properties
-
-      - name: Configure PostHog dSYM upload skip
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-
-          path = Path("iosApp/Scripts/upload-posthog-symbols.sh")
-          contents = path.read_text()
-          marker = 'if [ "${CONFIGURATION:-}" != "Release" ]; then'
-          guard = '''if [ "${NUVIO_SKIP_POSTHOG_DSYM_UPLOAD:-0}" = "1" ]; then
-            echo "Skipping PostHog dSYM upload."
-            exit 0
-          fi
-
-          '''
-
-          if "NUVIO_SKIP_POSTHOG_DSYM_UPLOAD" not in contents:
-              if marker not in contents:
-                  raise SystemExit(f"Could not find insertion point in {path}")
-              contents = contents.replace(marker, guard + marker, 1)
-              path.write_text(contents)
-          PY
 
       - name: Prepare iOS dependencies
         run: ./scripts/prepare-ios-dependencies.sh
