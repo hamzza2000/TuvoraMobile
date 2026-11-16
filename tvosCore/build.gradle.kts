@@ -49,6 +49,8 @@ val tvosExcludedCommon = listOf(
     "com/nuvio/app/features/livetv/pause/LivePauseBinding.kt",
     // Calendar: the Compose slots and their string helpers; Apple TV draws the Calendar in SwiftUI (TvCalendar facade).
     "com/nuvio/app/features/calendar/api/CalendarUiSlots.kt", "com/nuvio/app/features/calendar/internal/CalendarUiText.kt",
+    // Game screen: the Compose locals (Apple TV draws its own game screen in SwiftUI over the shared core).
+    "com/nuvio/app/features/sportsdetail/api/SportsDetailLocals.kt",
     // Phone/desktop long-press channel menu (sheet + toast); Apple TV has its own SwiftUI context menu.
     "com/nuvio/app/features/iptv/IptvLiveChannelMenu.kt",
     // Phone/desktop shell hook for setup links and the empty-screen button; it opens the Add Playlist page
@@ -268,6 +270,10 @@ kotlin {
             // Watch party: the shared rules Apple TV's party screen and player sync run on.
             kotlin.srcDir(composeAppSrc.resolve("commonTest/kotlin/com/nuvio/app/features/party"))
             kotlin.srcDir(composeAppSrc.resolve("commonTest/kotlin/com/nuvio/app/features/calendar"))
+            // Game screen core (sections, moments, refresh, assembler, strips): the shared rules Apple TV's game screen runs on.
+            kotlin.srcDir(composeAppSrc.resolve("commonTest/kotlin/com/nuvio/app/features/sportsdetail"))
+            // Tests SportsDetailLocals (Compose CompositionLocal wiring), which tvosCore excludes.
+            kotlin.exclude("**/SportsDetailAccessTest.kt")
             // Tests a Compose-side helper (CalendarHomeSection.kt) that tvosCore excludes: Apple TV draws the Calendar in SwiftUI.
             kotlin.exclude("**/CalendarTitleTypeForTest.kt") // relative to the calendar srcDir above
         }
