@@ -49,13 +49,14 @@ import com.nuvio.app.features.sportsdetail.api.VersusHeader
 import com.nuvio.app.features.sportsdetail.internal.GameDetailUiPolicy
 import com.nuvio.app.features.sportsdetail.internal.Moment
 import com.nuvio.app.features.sportsdetail.internal.MotionSpec
+import com.nuvio.app.features.sportsdetail.internal.roundLabel
 
 /** Scoreboard card: logo, rank, name, record, score (counts + pulses once on a real change); centre LIVE pill + clock. */
 @Composable
 internal fun GameScoreboard(detail: GameDetail, modifier: Modifier = Modifier) {
     NuvioSurfaceCard(modifier = modifier) {
         Text(
-            listOfNotNull(detail.leagueName.takeIf { it.isNotBlank() }, detail.round?.let { "Round $it" }, detail.venue).joinToString(" · "),
+            listOfNotNull(detail.leagueName.takeIf { it.isNotBlank() }, detail.round?.let { roundLabel(detail.sport, it) }, detail.venue).joinToString(" · "),
             style = MaterialTheme.typography.labelMedium,
             color = MaterialTheme.nuvio.colors.textMuted,
             maxLines = 1,
@@ -155,7 +156,7 @@ internal fun StatusLine(detail: GameDetail) {
         }
         GameState.FINAL -> Text(live?.detail?.takeIf { it.isNotBlank() } ?: "Final", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.nuvio.colors.textSecondary)
         GameState.POSTPONED -> Text("Postponed", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.nuvio.colors.textSecondary)
-        GameState.UPCOMING -> Text(detail.startsAt.replace('T', ' ').removeSuffix("Z").take(16) + " UTC", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.nuvio.colors.textSecondary)
+        GameState.UPCOMING -> Text(UpcomingStartText.of(detail.startsAt, RadarStartTimeFormat), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.nuvio.colors.textSecondary)
     }
 }
 
@@ -218,4 +219,10 @@ private fun ScoreAnnouncement(detail: GameDetail) {
             contentDescription = said
         },
     )
+}
+
+/** The match-list cards' device-local day/time formats, as the game screen's start-time port. */
+private object RadarStartTimeFormat : com.nuvio.app.features.sportsdetail.internal.StartTimeFormat {
+    override fun dayLabel(epochMs: Long): String = com.nuvio.app.features.radar.RadarTime.dayLabel(epochMs)
+    override fun formatTime(epochMs: Long): String = com.nuvio.app.features.radar.RadarTime.formatTime(epochMs)
 }

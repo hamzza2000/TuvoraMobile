@@ -8,7 +8,10 @@ import com.nuvio.app.features.sportsdetail.api.TeamsHeader
 import com.nuvio.app.features.sportsdetail.api.TimelineItem
 import com.nuvio.app.features.sportsdetail.api.WinProbabilityBlock
 import com.nuvio.app.features.sportsdetail.internal.GameDetailUiPolicy
+import com.nuvio.app.features.sportsdetail.internal.ChannelLabelPolicy
 import com.nuvio.app.features.sportsdetail.internal.GameSection
+import com.nuvio.app.features.sportsdetail.internal.GameStartLabel
+import com.nuvio.app.features.sportsdetail.internal.StartTimeFormat
 
 /** Pure view-models for the game screen: every decision a composable would otherwise make lives here and is unit-tested. */
 
@@ -206,4 +209,24 @@ internal class PlayedLedger {
         if (w == null || w.first != token) { windows[slot] = token to nowMs; return true }
         return nowMs - w.second <= windowMs
     }
+}
+
+/** The soft edge under the fixed back-button header: only while content has scrolled under it and no sticky score bar already covers that edge. */
+internal object GameTopFade {
+    fun visible(scrolledPastTop: Boolean, stickyBarShown: Boolean): Boolean = scrolledPastTop && !stickyBarShown
+}
+
+/** Upcoming status text: the device-local start ("Today 8:15 PM"); the old UTC wording only when the feed gave no parseable date. */
+internal object UpcomingStartText {
+    fun of(startsAt: String, format: StartTimeFormat): String =
+        GameStartLabel.of(startsAt, format) ?: (startsAt.replace('T', ' ').removeSuffix("Z").take(16) + " UTC")
+}
+
+/** The Watch row's one primary button: a title and the cleaned channel as its second line ("Play" / "On TSN 1 · your channels"). */
+internal data class WatchButtonText(val title: String, val subtitle: String)
+
+internal object WatchRowText {
+    fun play(channelName: String) = WatchButtonText("Play", subtitle(channelName))
+    fun switchTo(channelName: String) = WatchButtonText("Switch", subtitle(channelName))
+    private fun subtitle(channelName: String) = "On ${ChannelLabelPolicy.clean(channelName)} · your channels"
 }

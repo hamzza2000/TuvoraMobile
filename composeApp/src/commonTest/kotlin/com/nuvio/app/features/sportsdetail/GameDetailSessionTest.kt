@@ -125,6 +125,22 @@ class GameDetailSessionTest {
         assertEquals("State Farm Arena", d.venue)
     }
 
+    @Test fun `G6 - the team record from the ESPN scoreboard fills a backend header that has none`() = runBlocking<Unit> {
+        val espn = FakeEspn(scoreboardOf(SportsFixtures.espn_nba_event), SourceResult.Ok(parse(SportsFixtures.espn_nba_summary)))
+        val h = assertIs<TeamsHeader>(loaded(session(FakeTsdb(tsdbEvent(hs = "1", aws = "2", state = GameState.LIVE)), espn).tick()).header)
+        assertEquals("6-4", h.home.record)
+        assertEquals("4-5", h.away.record)
+    }
+
+    @Test fun `G6 - a record the backend already has is kept`() = runBlocking<Unit> {
+        val espn = FakeEspn(scoreboardOf(SportsFixtures.espn_nba_event), SourceResult.Ok(parse(SportsFixtures.espn_nba_summary)))
+        val tsdb = tsdbEvent(hs = "1", aws = "2", state = GameState.LIVE)
+        val withRec = SourceResult.Ok((tsdb.value.header as TeamsHeader).let { t -> tsdb.value.copy(header = TeamsHeader(t.home.copy(record = "9-0"), t.away)) })
+        val h = assertIs<TeamsHeader>(loaded(session(FakeTsdb(withRec), espn).tick()).header)
+        assertEquals("9-0", h.home.record)
+        assertEquals("4-5", h.away.record)
+    }
+
     @Test fun `when the ESPN event is for different teams the primary header stays untouched`() = runBlocking<Unit> {
         val espn = FakeEspn(scoreboardOf(SportsFixtures.espn_nba_event), SourceResult.Ok(parse(SportsFixtures.espn_nba_summary)))
         val pinned = ref.copy(espnEventId = "401909287")      // a bad pin: ESPN's Hawks game for a Celtics game
@@ -428,6 +444,20 @@ class GameDetailSessionTest {
     private fun nhlTsdb(state: GameState) = FakeTsdb(tsdbEvent(home = "Buffalo Sabres", away = "Columbus Blue Jackets", state = state))
 
     private fun winBlock(d: GameDetail) = d.blocks.filterIsInstance<com.nuvio.app.features.sportsdetail.api.WinProbabilityBlock>().singleOrNull()
+
+    @Test fun `F9 - a lagging backend UPCOMING with ESPN LIVE still fetches the summary so plays and strips appear`() = runBlocking<Unit> {
+        val espn = nhl("post", "in")
+        val s = session(FakeTsdb(tsdbEvent(home = "Buffalo Sabres", away = "Columbus Blue Jackets", state = GameState.UPCOMING, hs = null, aws = null)), espn, r = nhlRef)
+        val d = loaded(s.tick())
+        assertEquals(GameState.LIVE, d.state, "the header already shows the fresher ESPN state")
+        assertEquals(1, espn.summaryCalls, "the summary decision must use that same fresher state")
+    }
+
+    @Test fun `F9 - a genuinely upcoming game on both sources still skips the summary`() = runBlocking<Unit> {
+        val espn = nhl("post", "pre")
+        loaded(session(FakeTsdb(tsdbEvent(home = "Buffalo Sabres", away = "Columbus Blue Jackets", state = GameState.UPCOMING, hs = null, aws = null)), espn, r = nhlRef).tick())
+        assertEquals(0, espn.summaryCalls)
+    }
 
     @Test fun `ESPN stays the headline but the market is always asked for storylines and the chart`() = runBlocking<Unit> {
         val liveEvent = SportsFixtures.espn_nba_event.replace("\"state\":\"post\"", "\"state\":\"in\"")

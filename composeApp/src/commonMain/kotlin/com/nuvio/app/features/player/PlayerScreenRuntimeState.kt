@@ -7,6 +7,8 @@ import androidx.compose.ui.hapticfeedback.HapticFeedback
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
+import com.nuvio.app.features.addons.AddonPlayerAction
+import com.nuvio.app.features.addons.AddonPlayerEventTarget
 import com.nuvio.app.features.addons.AddonsUiState
 import com.nuvio.app.features.details.MetaDetails
 import com.nuvio.app.features.details.MetaDetailsUiState
@@ -173,6 +175,11 @@ internal class PlayerScreenRuntime(
     var errorMessage by mutableStateOf<String?>(null)
     /** The live reconnect ladder ran out: the error modal offers Retry beside Go back. */
     var liveReconnectFailed by mutableStateOf(false)
+    /**
+     * "Reconnecting… (attempt N of M)" + why, while the live reconnect ladder runs; mirrored from the surface's
+     * [com.nuvio.app.core.analytics.LivePlaybackReconnector.status] on every live snapshot. Null otherwise.
+     */
+    var liveReconnectStatus by mutableStateOf<com.nuvio.app.core.analytics.LiveReconnectStatus?>(null)
     /** Bumped by the viewer's Retry on that error; the live freeze ladder starts over on it (never on its own reconnects). */
     var liveUserRetryGeneration by mutableStateOf(0)
     /** A VOD start hit [VodStartDeadlinePolicy.FAIL_AFTER_MS] with no first frame: the error modal offers Retry. */
@@ -212,6 +219,8 @@ internal class PlayerScreenRuntime(
     var pendingSeekScrobbleRestart by mutableStateOf(false)
     var hasSentCompletionScrobbleForCurrentItem by mutableStateOf(false)
     var currentTrackingMedia by mutableStateOf<TrackingMediaReference?>(null)
+    var activeAddonPlayerEventTarget: AddonPlayerEventTarget? = null
+    var lastAddonPlayerAction: AddonPlayerAction? = null
 
     var showSourcesPanel by mutableStateOf(false)
     var showEpisodesPanel by mutableStateOf(false)
@@ -265,6 +274,11 @@ internal class PlayerScreenRuntime(
     var credentialRefreshBaselinePositionMs by mutableStateOf(0L)
     /** URL opened from the reuse-last-link cache; it is refreshed after a playback error even without a token. */
     var linkCacheSourceUrl: String? = args.sourceUrl.takeIf { args.sourceFromLinkCache && it.isNotBlank() }
+    /** URL picked by auto source selection; only this source falls back to the next match on failure. */
+    var autoSelectedSourceUrl: String? = args.sourceUrl.takeIf { args.sourceAutoSelected && it.isNotBlank() }
+    var sourceFallbackAttempts = 0
+    val sourceFallbackTriedKeys = mutableSetOf<String>()
+    var sourceFallbackJob: Job? = null
 
     var showAudioModal by mutableStateOf(false)
     var showSubtitleModal by mutableStateOf(false)

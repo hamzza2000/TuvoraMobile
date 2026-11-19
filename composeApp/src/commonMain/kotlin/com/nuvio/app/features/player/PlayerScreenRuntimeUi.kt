@@ -4,6 +4,7 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.fillMaxSize
@@ -22,6 +23,13 @@ import com.nuvio.app.core.analytics.Breadcrumbs
 import com.nuvio.app.core.analytics.LivePlaybackFreezeReporter
 import com.nuvio.app.core.analytics.LivePlaybackReconnector
 import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onKeyEvent
+import androidx.compose.ui.input.key.type
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -142,6 +150,10 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi(
     val videoModifier = if (fold != null) Modifier.fillMaxWidth().height(fold.top) else Modifier.fillMaxSize()
     val panelModifier = if (fold != null) Modifier.fillMaxSize().padding(top = fold.bottom) else Modifier.fillMaxSize()
     val playbackGesturesEnabled = initialLoadCompleted && errorMessage == null
+    val keyFocusRequester = remember { FocusRequester() }
+    LaunchedEffect(keyFocusRequester) {
+        keyFocusRequester.requestFocus()
+    }
 
     BindAutoSyncRuntimeEffects() // AutoSync hook
 
@@ -151,6 +163,20 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi(
             .padding(end = partyPanelInset)
             .clipToBounds()
             .onSizeChanged { layoutSize = it }
+            .onKeyEvent { event ->
+                if (event.type != KeyEventType.KeyDown || playerControlsLocked) return@onKeyEvent false
+                when {
+                    event.key == Key.Spacebar -> togglePlayback()
+                    event.key == Key.DirectionLeft && playbackGesturesEnabled -> seekBy(-10_000L)
+                    event.key == Key.DirectionRight && playbackGesturesEnabled -> seekBy(10_000L)
+                    event.key == Key.DirectionUp -> changeVolumeBy(PlayerKeyVolumeStep)
+                    event.key == Key.DirectionDown -> changeVolumeBy(-PlayerKeyVolumeStep)
+                    else -> return@onKeyEvent false
+                }
+                true
+            }
+            .focusRequester(keyFocusRequester)
+            .focusable()
             .playerSurfaceTapGestures(
                 layoutSize = layoutSize,
                 playbackGesturesEnabled = playbackGesturesEnabled,
@@ -211,9 +237,13 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi(
         val freezeReconnector = remember { LivePlaybackReconnector(freezeReporter) }
         // The ladder belongs to the channel: a zap or the viewer's Retry starts it over; the
         // pipeline's own reconnects and re-mints (a new URL every time) never do.
-        LaunchedEffect(activeVideoId) { freezeReconnector.onChannelChanged() }
+        LaunchedEffect(activeVideoId) {
+            freezeReconnector.onChannelChanged()
+            liveReconnectStatus = null
+        }
         LaunchedEffect(liveUserRetryGeneration) {
             if (liveUserRetryGeneration > 0) freezeReconnector.onUserRetry()
+            liveReconnectStatus = null
         }
         val liveReconnectFailedMessage = stringResource(Res.string.player_live_reconnect_failed)
         // Reset per source so a reconnect or source switch records a fresh start; the persisted
@@ -370,6 +400,7 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi(
                                     errorMessage = liveReconnectFailedMessage
                                 },
                             )
+                            liveReconnectStatus = freezeReconnector.status.value
                         }
                         // A live channel has no end: ENDED means the upstream closed, and the
                         // reconnect above is what answers it. Pausing here would fight that, and
@@ -381,7 +412,15 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi(
                     },
                     onError = { message ->
                         if (!active.value || playbackKey != activePlaybackKey) return@PlatformPlayerSurface
+                        // Only the reason code is kept (the text can carry a host): it words the reconnect line.
+                        if (isLiveStream && message != null) {
+                            freezeReconnector.noteFailure(message)
+                            liveReconnectStatus = freezeReconnector.status.value
+                        }
                         if (message != null && tryRefreshExpiredLinkAfterError(message)) {
+                            return@PlatformPlayerSurface
+                        }
+                        if (message != null && tryFallbackToNextSourceAfterError(message)) {
                             return@PlatformPlayerSurface
                         }
                         // Engine failover is decided here, driven by its own player setting;
@@ -438,6 +477,14 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi(
                 p2pRebufferProgress = p2pRebufferProgress,
                 folded = fold != null,
             )
+            // The live reconnect ladder is running: which attempt, and why. The error modal owns the give-up.
+            val reconnecting = liveReconnectStatus
+            if (reconnecting != null && errorMessage == null && !isInPip) {
+                LiveReconnectStatusLine(
+                    status = reconnecting,
+                    modifier = Modifier.align(androidx.compose.ui.Alignment.Center),
+                )
+            }
         }
     }
     Box(modifier = panelModifier) {
@@ -710,7 +757,7 @@ private fun BoxScope.RenderPlaybackOverlays(
             p2pInitialLoadingMessage ?: playerLoadingStatusMessage(
                 showStatus = true,
                 controllerReady = playerController != null,
-                buffering = playbackSnapshot.isLoading,
+                snapshot = playbackSnapshot,
             )
         } else null,
         startOverLabel = resumeUi.startOverLabel,
@@ -768,6 +815,17 @@ private fun BoxScope.RenderPlaybackOverlays(
             onDismissError = {
                 flushWatchProgress()
                 args.onBack()
+            },
+            episodeAlertPrompt = if (isSeries) {
+                com.nuvio.app.features.notifications.EpisodeAlertPromptInput(
+                    contentType = parentMetaType,
+                    contentId = parentMetaId,
+                    showTitle = title,
+                    nextEpisodeAired = nextEpisodeInfo?.hasAired,
+                    atEnd = isAtEpisodeEndForAlertPrompt(),
+                )
+            } else {
+                null
             },
             onRetryError = if (vodStartFailed) {
                 {

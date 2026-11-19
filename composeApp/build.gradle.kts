@@ -202,7 +202,7 @@ abstract class GenerateRuntimeConfigsTask : DefaultTask() {
                 |package com.nuvio.app.features.player.skip
                 |
                 |object IntroDbConfig {
-                |    const val URL = "${props.getProperty("INTRODB_API_URL", "")}" 
+                |    const val URL = "${props.getProperty("INTRODB_API_URL", "").ifBlank { "https://api.introdb.app" }}"
                 |}
                 """.trimMargin()
             )
@@ -732,5 +732,13 @@ tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
     testLogging {
         events("failed", "skipped")
         exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
+    }
+}
+
+composeCompiler {
+    stabilityConfigurationFiles.add(project.layout.projectDirectory.file("compose_stability_config.conf"))
+    if (providers.gradleProperty("composeCompilerReports").orNull == "true") {
+        metricsDestination = layout.buildDirectory.dir("compose_metrics")
+        reportsDestination = layout.buildDirectory.dir("compose_reports")
     }
 }

@@ -294,6 +294,12 @@ private fun PlatformPlayerSurfaceInner(
         mutableStateOf(gated)
     }
 
+    // Every engine failure lands in the flight recorder as closed codes (surface/engine/category/phase), so a
+    // "won't play" report says why; an ExoPlayer failure that fails over to libmpv is recorded too.
+    val failureTrail = remember(playerSourceKey) {
+        PlaybackFailureTrailRecorder(PlaybackFailureTrail.surfaceOf(streamType, isCatchUpPlayback))
+    }
+
     when (activeEngine) {
         ResolvedAndroidPlaybackEngine.ExoPlayer -> ExoPlayerSurface(
             sourceUrl = sourceUrl,
@@ -319,8 +325,12 @@ private fun PlatformPlayerSurfaceInner(
             useNativeController = useNativeController,
             onInitialPositionHandled = onInitialPositionHandled,
             onControllerReady = onControllerReady,
-            onSnapshot = onSnapshot,
+            onSnapshot = { snapshot ->
+                failureTrail.onSnapshot(snapshot)
+                onSnapshot(snapshot)
+            },
             onError = { message, linkAuthFailure ->
+                failureTrail.onError(message, engine = "exoplayer")
                 // A 401/403/410 is the LINK being refused, not a decoding problem — libmpv would be
                 // handed the same dead URL and fail identically. Worse, swallowing it as `null` here
                 // hid it from the screen's expired-link recovery (which only runs for a non-null
@@ -377,8 +387,14 @@ private fun PlatformPlayerSurfaceInner(
                 yuv420pEnabled = playerSettings.androidLibmpvYuv420pEnabled,
                 preferredSubtitleLanguage = playerSettings.preferredSubtitleLanguage,
                 onControllerReady = onControllerReady,
-                onSnapshot = onSnapshot,
-                onError = onError,
+                onSnapshot = { snapshot ->
+                    failureTrail.onSnapshot(snapshot)
+                    onSnapshot(snapshot)
+                },
+                onError = { message ->
+                    failureTrail.onError(message, engine = "libmpv")
+                    onError(message)
+                },
             )
         }
     }
@@ -1634,7 +1650,7 @@ private fun ExoPlayerSurface(
                 playerView.applyVideoZoom(videoZoom)
             },
         )
-        StyledSubtitleOverlay(subtitlePresenter.text, currentSubtitleStyle)
+        StyledSubtitleOverlay(subtitlePresenter.cues, currentSubtitleStyle)
     }
 }
 
@@ -1801,6 +1817,7 @@ private fun LibmpvPlayerSurface(
             override fun event(eventId: Int, data: MPVNode) {
                 when (eventId) {
                     MPV.mpvEvent.MPV_EVENT_START_FILE -> {
+                        view.onFileStarted()
                         errorLog.clear()
                         Log.i(
                             PLAYER_DIAGNOSTIC_TAG,
@@ -1816,7 +1833,11 @@ private fun LibmpvPlayerSurface(
                     }
                     MPV.mpvEvent.MPV_EVENT_FILE_LOADED,
                     MPV.mpvEvent.MPV_EVENT_PLAYBACK_RESTART -> {
-                        if (eventId == MPV.mpvEvent.MPV_EVENT_FILE_LOADED) view.attachStartupSubtitles()
+                        if (eventId == MPV.mpvEvent.MPV_EVENT_FILE_LOADED) {
+                            view.endLiveOpenLogWindow()
+                            view.onFileLoaded()
+                            view.attachStartupSubtitles()
+                        }
                         coroutineScope.launch(Dispatchers.Main.immediate) {
                             latestOnError.value(null)
                             val snapshot = view.snapshot()
@@ -1833,6 +1854,7 @@ private fun LibmpvPlayerSurface(
                         }
                     }
                     MPV.mpvEvent.MPV_EVENT_END_FILE -> {
+                        view.endLiveOpenLogWindow()
                         val endReason = data.nodeString("reason")
                         val fileError = data.nodeString("file_error")
                         val endFileJson = data.toJson()
@@ -1848,6 +1870,26 @@ private fun LibmpvPlayerSurface(
                                     "durationMs=${snapshot.durationMs} eof=${snapshot.isEnded} " +
                                     "data=${diagnosticPlayerMessage(endFileJson)}",
                             )
+                            // A live open the provider refused with a status (456 firewall, 458/509 connection cap,
+                            // 5xx): say so BEFORE the ended snapshot, so the screen classifies it (reason line, the
+                            // bounded open retry) instead of reading a silent end. Without a status, live keeps its own
+                            // END_FILE recovery below.
+                            val liveLogLine = if (isLiveStream) errorLog.logLine() else null
+                            val liveHttpCode = mpvLiveEndFileHttpStatus(
+                                isLiveStream, LivePlaybackStartupPolicy.hasStarted(snapshot), endReason, liveLogLine,
+                            )
+                            if (liveHttpCode != null) {
+                                latestOnError.value(
+                                    mpvErrorMessage(
+                                        fileError = fileError,
+                                        logLine = liveLogLine,
+                                        codecContext = null,
+                                        fallback = getString(Res.string.player_unable_to_play_stream),
+                                        httpExplanation = httpStatusExplanationText(liveHttpCode),
+                                        statusExplanation = "",
+                                    ),
+                                )
+                            }
                             latestOnSnapshot.value(snapshot)
                             nowPlayingController?.syncPlayback(snapshot)
                             view.keepScreenOn = view.shouldKeepScreenOn()
@@ -2039,7 +2081,7 @@ private fun LibmpvPlayerSurface(
             view.release()
         },
     )
-        playerViewRef?.let { view -> StyledSubtitleOverlay(view.subtitleText, view.subtitleStyle) }
+        playerViewRef?.let { view -> StyledSubtitleOverlay(view.subtitleCues, view.subtitleStyle) }
     }
 }
 
@@ -2193,7 +2235,8 @@ private class NuvioLibmpvView(
                     runCatching { mpv.command("stop") }
                     detachSurfaceInternal()
                     runCatching { mpv.removeObserver(propertyShadow) }
-                    runCatching { mpv.destroy() }
+                    // mpv-android-lib 0.2: close() replaces destroy() (still on the ctl queue, never Main).
+                    runCatching { mpv.close() }
                         .onSuccess { destroyed = true }
                         .onFailure { Log.w(TAG, "Failed to destroy libmpv cleanly", it) }
                 } finally {
@@ -2304,6 +2347,13 @@ private class NuvioLibmpvView(
     // (no true presented-frames property exists). Snapshot diagnostics only for now.
     @Volatile private var obsVoDroppedFrames = 0L
     @Volatile private var obsVoDelayedFrames = 0L
+
+    /** mpv has opened the current file and read its tracks (upstream isOpening). Written on the event/ctl threads. */
+    @Volatile private var fileLoaded = false
+
+    fun onFileStarted() { fileLoaded = false }
+
+    fun onFileLoaded() { fileLoaded = true }
 
     private fun shadowPositionSec(timePosSec: Double): Double = mpvPlaybackPositionSec(
         timePosSec = timePosSec,
@@ -2475,7 +2525,7 @@ private class NuvioLibmpvView(
         attachedSurface = null
     }
 
-    var subtitleText by mutableStateOf("")
+    var subtitleCues by mutableStateOf(StyledSubtitleCues())
         private set
     var subtitleStyle by mutableStateOf(SubtitleStyleState.DEFAULT)
         private set
@@ -2491,11 +2541,16 @@ private class NuvioLibmpvView(
                 mpv.setPropertyBoolean("sub-visibility", !styled)
                 styledSubtitleVisible = styled
             }
-            val text = if (styled) mpv.getPropertyString("sub-text").orEmpty() else ""
+            val text = if (styled) {
+                mpv.getPropertyString("sub-text/ass") ?: mpv.getPropertyString("sub-text").orEmpty()
+            } else {
+                ""
+            }
+            val cues = parseMpvSubtitleText(text)
             val style = appliedSubtitleStyle
             post {
                 if (!released.get()) {
-                    subtitleText = text
+                    subtitleCues = cues
                     subtitleStyle = style
                 }
             }
@@ -2504,7 +2559,8 @@ private class NuvioLibmpvView(
 
     override fun initOptions() {
         setVo(videoOutput)
-        mpv.setOptionString("profile", "fast")
+        // 0.2.x creates and initializes mpv in the MPV constructor, so options arrive after init: a profile is applied by command.
+        mpv.command("apply-profile", "fast")
         mpv.setOptionString("hwdec", if (hardwareDecodingEnabled) "auto" else "no")
         if (yuv420pEnabled) {
             mpv.setOptionString("vf", "format=yuv420p")
@@ -2620,6 +2676,12 @@ private class NuvioLibmpvView(
         }
     }
 
+    /** The live open is over (file loaded or ended): the `ffmpeg` module goes silent again. Any thread. */
+    fun endLiveOpenLogWindow() {
+        if (!isLiveStream) return
+        ctl { mpv.setPropertyString("msg-level", MpvLogLevelPolicy.specFor(liveOpen = false)) }
+    }
+
     // Runs on the mpv-ctl thread only.
     private fun loadCurrentSource(playWhenReady: Boolean, startOption: String? = null) {
         val sourceUrl = currentSourceUrl ?: return
@@ -2633,6 +2695,10 @@ private class NuvioLibmpvView(
         // options require reloading the file for changes to take effect"). Set as a global, not a
         // loadfile per-file option, so retry()/restartFromBeginning()/live rejoin reuse it unchanged.
         mpv.setPropertyString("stream-lavf-o", currentStreamLavfOptions)
+        // A refused live open ends END_FILE "loading failed" with no status; FFmpeg's "HTTP error NNN" warning is the
+        // only carrier, in module "ffmpeg", which stays silent otherwise (MpvLogLevelPolicy). Ask for it for this open.
+        if (isLiveStream) mpv.setPropertyString("msg-level", MpvLogLevelPolicy.specFor(liveOpen = true))
+        fileLoaded = false
         if (startOption != null) {
             mpv.command("loadfile", sourceUrl.toMpvSource(), "replace", "-1", startOption)
         } else {
@@ -2738,6 +2804,7 @@ private class NuvioLibmpvView(
         obsVideoFrameTicks = MpvVideoOutputSignal.advance(obsVideoFrameTicks, obsEstimatedVfFps)
         return PlayerPlaybackSnapshot(
             isLoading = isLoading,
+            isOpening = !fileLoaded,
             isPlaying = !paused && !isLoading && !idle && !ended,
             isEnded = ended,
             durationMs = durationMs,
@@ -3306,8 +3373,11 @@ private const val MPV_SUBTITLE_OUTLINE_SIZE_SCALE = 1.5
 
 private fun ExoPlayer.snapshot(): PlayerPlaybackSnapshot {
     val (videoWidth, videoHeight) = videoDimensions()
+    val isLoading = playbackState == Player.STATE_IDLE || playbackState == Player.STATE_BUFFERING
     return PlayerPlaybackSnapshot(
-        isLoading = playbackState == Player.STATE_IDLE || playbackState == Player.STATE_BUFFERING,
+        isLoading = isLoading,
+        // Tracks are known once the source is opened and its container read.
+        isOpening = isLoading && currentTracks.isEmpty,
         isPlaying = isPlaying,
         isEnded = playbackState == Player.STATE_ENDED,
         durationMs = duration.coerceAtLeast(0L),

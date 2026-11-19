@@ -71,6 +71,8 @@ val tvosExcludedCommon = listOf(
     "com/nuvio/app/features/player/PlayerNextEpisodeAutoPlay.kt",
     "com/nuvio/app/features/player/PlayerScreenModalHosts.kt", "com/nuvio/app/features/player/ResumeLoadingUi.kt",
     "com/nuvio/app/features/player/PlayerScreenRuntime*.kt",
+    // 16th sync: upstream fall-back-to-next-source; its runtime half is PlayerScreenRuntime*, so the run helper goes with it.
+    "com/nuvio/app/features/player/PlayerSourceFallbackRun.kt",
     // Wraps the engine controller (PlayerEngine.kt is Compose-side); Apple TV has no loopback-relayed subtitles.
     "com/nuvio/app/features/player/RelayedSubtitleController.kt",
     // Compose player toast text (uses PlayerLayout's time formatter); Apple TV shows its own skip feedback.
@@ -88,6 +90,9 @@ val tvosExcludedCommon = listOf(
     // 15th sync (2026-11-12): upstream moved the AutoSync engine to commonMain and added an mpv coordinator
     // that wraps the Compose PlayerEngineController (iPhone libmpv). Same Apple TV gap as above.
     "com/nuvio/app/features/autosync/AutoSyncMpvCoordinator.kt",
+    // Back for an in-screen mode (the phone hub search): Android Back / iPhone swipe. Apple TV closes its
+    // search sheet with the Menu button in SwiftUI (IptvHubScreen onExitCommand / .sheet).
+    "com/nuvio/app/core/ui/ModeBackHandler.kt",
 )
 val tvosExcludedIos = listOf(
     // iPhone-only APIs; Apple TV supplies its own actual in tvosCore/src/tvosMain (named gaps).
@@ -98,6 +103,7 @@ val tvosExcludedIos = listOf(
     "com/nuvio/app/features/updater/**",                              // in-app APK updater
     "com/nuvio/app/core/storage/AppleDataDirectory.ios.kt",          // tvOS writes only to Caches
     "com/nuvio/app/features/autosync/AutoSyncMpvPlatform.ios.kt",    // iPhone libmpv AutoSync glue (Apple TV: AutoSync gap)
+    "com/nuvio/app/core/ui/ModeBackHandler.ios.kt",                   // iPhone swipe-back; Apple TV uses the Menu button in SwiftUI
 )
 
 fun uiFiles(sourceSet: String): List<String> {
@@ -265,6 +271,8 @@ kotlin {
             kotlin.srcDir(composeAppSrc.resolve("commonTest/kotlin/com/nuvio/app/features/iptv/refresh"))
             kotlin.srcDir(composeAppSrc.resolve("commonTest/kotlin/com/nuvio/app/features/iptv/match/progress"))
             kotlin.srcDir(composeAppSrc.resolve("commonTest/kotlin/com/nuvio/app/features/epg"))
+            // The epg telemetry tests record through RecordingTelemetryPort; the rest of this folder tests shared telemetry too.
+            kotlin.srcDir(composeAppSrc.resolve("commonTest/kotlin/com/nuvio/app/core/telemetry"))
             kotlin.srcDir(composeAppSrc.resolve("commonTest/kotlin/com/nuvio/app/features/iptv/epg"))
             kotlin.srcDir(composeAppSrc.resolve("commonTest/kotlin/com/nuvio/app/features/iptv/overlay/customgroup"))
             // Watch party: the shared rules Apple TV's party screen and player sync run on.

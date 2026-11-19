@@ -31,6 +31,7 @@ import com.nuvio.app.features.sportsdetail.internal.GameSectionsPolicy
 import com.nuvio.app.features.sportsdetail.internal.Moment
 import com.nuvio.app.features.sportsdetail.internal.StandingsWindow
 import com.nuvio.app.features.sportsdetail.internal.TeamColor
+import com.nuvio.app.features.sportsdetail.internal.roundLabel
 import com.nuvio.app.features.sportsdetail.internal.WinChanceSeries
 
 /** Sections the right-hand panel can show (OVERVIEW is not a chip on TV: its content is the left column). */
@@ -225,8 +226,9 @@ data class TvGameScreenModel(
             else -> null
         }
 
-        internal fun leagueLine(league: String, round: String?): String {
-            val r = round?.trim()?.takeIf { it.isNotEmpty() }?.let { if (it.all(Char::isDigit)) "Round $it" else it }
+        /** The round reads through core's [roundLabel] ("Week 11" for American football, "Round 7" otherwise, a text round as the feed wrote it). */
+        internal fun leagueLine(league: String, sport: String?, round: String?): String {
+            val r = round?.trim()?.takeIf { it.isNotEmpty() }?.let { roundLabel(sport, it) }
             return listOfNotNull(league.takeIf { it.isNotBlank() }, r).joinToString(" · ")
         }
 
@@ -264,7 +266,7 @@ data class TvGameScreenModel(
             }
             val event = d.header as? EventHeader
             return TvScoreboard(
-                leagueLine = leagueLine(d.leagueName, d.round),
+                leagueLine = leagueLine(d.leagueName, d.sport, d.round),
                 statusMain = main,
                 statusSub = if (d.state == GameState.LIVE) statusSub(main, d.live) else null,
                 venue = d.venue?.takeIf { it.isNotBlank() },
@@ -288,7 +290,7 @@ data class TvGameScreenModel(
             return TvWinCard(
                 chance = TvWinChanceCard.from(block, d, nowMs),
                 homeColorHex = colors.first, awayColorHex = colors.second,
-                chart = WinChanceSeries.chart(block.history, spec).orEmpty(), leaderSide = spec.leaderSide, reference = spec.reference,
+                chart = if (WinChanceSeries.isVisible(block.history)) WinChanceSeries.chart(block.history, spec).orEmpty() else emptyList(), leaderSide = spec.leaderSide, reference = spec.reference,
                 markers = TvStrips.markers(d, colors), dividers = TvStrips.dividers(d),
                 homeName = sides?.first?.let { it.short?.takeIf(String::isNotBlank) ?: it.name }.orEmpty(),
                 awayName = sides?.second?.let { it.short?.takeIf(String::isNotBlank) ?: it.name }.orEmpty(),

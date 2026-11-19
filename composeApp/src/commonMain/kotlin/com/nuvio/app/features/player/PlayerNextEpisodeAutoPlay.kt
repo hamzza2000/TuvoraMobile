@@ -25,6 +25,25 @@ import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 
+/**
+ * The same last-stretch threshold that raises the next-episode card, without its side effects (no source preload), so
+ * the end-of-episode alert prompt appears at the same moment even when there is no next episode to preload.
+ */
+internal fun PlayerScreenRuntime.isAtEpisodeEndForAlertPrompt(): Boolean {
+    if (playbackSnapshotKey != activePlaybackKey || playbackSnapshot.isLoading ||
+        !initialSeekApplied || isScrubbingTimeline || errorMessage != null ||
+        isShortPlaceholderDuration(playbackSnapshot.durationMs)
+    ) return false
+    return playbackSnapshot.isEnded || PlayerNextEpisodeRules.shouldShowNextEpisodeCard(
+        positionMs = playbackSnapshot.positionMs,
+        durationMs = playbackSnapshot.durationMs,
+        skipIntervals = skipIntervals,
+        thresholdMode = playerSettingsUiState.nextEpisodeThresholdMode,
+        thresholdPercent = playerSettingsUiState.nextEpisodeThresholdPercent,
+        thresholdMinutesBeforeEnd = playerSettingsUiState.nextEpisodeThresholdMinutesBeforeEnd,
+    )
+}
+
 internal fun PlayerScreenRuntime.isAtNextEpisodeThreshold(): Boolean {
     if (playbackSnapshotKey != activePlaybackKey || playbackSnapshot.isLoading ||
         !initialSeekApplied || isScrubbingTimeline || errorMessage != null ||
@@ -83,7 +102,8 @@ internal fun CoroutineScope.launchPlayerNextEpisodeAutoPlay(
     // countdown and may open the source picker; auto never surfaces a panel uninvited.
     manualTrigger: Boolean,
     onDownloadedEpisodeSelected: (DownloadItem, MetaVideo) -> Unit,
-    onEpisodeStreamSelected: (StreamItem, MetaVideo) -> Unit,
+    /** The source auto-play picked, the episode, and the sources tried before the source. */
+    onEpisodeStreamSelected: (StreamItem, MetaVideo, PlayerSourceFallbackTried) -> Unit,
     onManualSelectionRequired: (MetaVideo) -> Unit,
     onSearchingChanged: (Boolean) -> Unit,
     onSourceNameChanged: (String?) -> Unit,
@@ -248,22 +268,47 @@ internal fun CoroutineScope.launchPlayerNextEpisodeAutoPlay(
             trySelectStream(allStreams)?.let(::selectStream) ?: finishWithoutSelection()
         }
 
-        val selected = selectedStream?.let { stream ->
-            when (val result = DirectDebridPlaybackResolver.resolveToPlayableStream(stream, nextVideo.season, nextVideo.episode)) {
-                is DirectDebridPlayableResult.Success -> result.stream
-                else -> {
-                    result.toastMessage()?.let { NuvioToastController.show(it) }
-                    PlayerStreamsRepository.loadEpisodeStreams(
-                        type = type,
-                        videoId = nextVideo.id,
-                        season = nextVideo.season,
-                        episode = nextVideo.episode,
-                        forceRefresh = true,
+        // A debrid result that cannot be played (expired, no longer cached, a failed resolve) moves
+        // on to the next source auto selection would pick when falling back is on, the way the
+        // stream screen does. Only the last failure is shown.
+        val resolveRun = selectedStream?.let { stream ->
+            resolveWithSourceFallback<StreamItem, DirectDebridPlayableResult>(
+                first = stream,
+                maxSources = if (settings.streamAutoPlayFallbackActive) settings.streamAutoPlayFallbackMaxSources else 0,
+                resolve = { candidate ->
+                    when (
+                        val result = DirectDebridPlaybackResolver.resolveToPlayableStream(
+                            candidate,
+                            nextVideo.season,
+                            nextVideo.episode,
+                        )
+                    ) {
+                        is DirectDebridPlayableResult.Success -> PlayerSourceResolveAttempt.Resolved(result.stream)
+                        else -> PlayerSourceResolveAttempt.Failed(result)
+                    }
+                },
+                nextCandidate = { failed, triedKeys ->
+                    nextSourceFallbackCandidate(
+                        streams = PlayerStreamsRepository.episodeStreamsState.value.groups.flatMap { it.streams },
+                        settings = settings,
+                        triedKeys = triedKeys,
+                        failedAddonId = failed.addonId,
+                        failedInfoHash = failed.p2pInfoHash,
                     )
-                    null
-                }
-            }
+                },
+            )
         }
+        resolveRun?.failure?.let { result ->
+            result.toastMessage()?.let { NuvioToastController.show(it) }
+            PlayerStreamsRepository.loadEpisodeStreams(
+                type = type,
+                videoId = nextVideo.id,
+                season = nextVideo.season,
+                episode = nextVideo.episode,
+                forceRefresh = true,
+            )
+        }
+        val selected = resolveRun?.resolved
         onSearchingChanged(false)
         if (selected != null) {
             onSourceNameChanged((selected.name?.takeIf { it.isNotBlank() } ?: selected.addonName).trim())
@@ -273,7 +318,7 @@ internal fun CoroutineScope.launchPlayerNextEpisodeAutoPlay(
                     delay(1000)
                 }
             }
-            onEpisodeStreamSelected(selected, nextVideo)
+            onEpisodeStreamSelected(selected, nextVideo, resolveRun.tried)
             onNextEpisodeCardVisibleChanged(false)
             onCountdownChanged(null)
             onSourceNameChanged(null)
