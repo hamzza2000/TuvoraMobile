@@ -11,6 +11,10 @@ import com.nuvio.app.features.player.LivePlaybackStartupPolicy
 import com.nuvio.app.features.iptv.stalker.StalkerStreamFallback
 import com.nuvio.app.features.player.MpvStartPosition
 import com.nuvio.app.features.player.NuvioPlayerBridge
+import com.nuvio.app.features.player.decodeHealthSignals
+import com.nuvio.app.features.player.decodeHealthStreamInfo
+import com.nuvio.app.features.player.decodePlayerStreamInfo
+import com.nuvio.app.features.player.onLiveSnapshot
 import com.nuvio.app.features.player.NuvioPlayerBridgeCreator
 import com.nuvio.app.features.player.PlayerLaunch
 import com.nuvio.app.features.player.StartDeadlineClock
@@ -32,7 +36,6 @@ import com.nuvio.app.features.player.addonSubtitleRequests
 import com.nuvio.app.features.addons.AddonRepository
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
-import com.nuvio.app.features.player.decodePlayerStreamInfo
 import com.nuvio.app.features.player.skip.SkipInterval
 import com.nuvio.app.features.player.skip.SkipIntroRepository
 import com.nuvio.app.features.watchprogress.WatchProgressRepository
@@ -248,6 +251,8 @@ class TvPlayerSession(
     private val playbackSession = launch.externalPlaybackSession()
     private val gate = TvProgressGate()
     private var monitor = TvLiveMonitor()
+    /** Decode-health telemetry for this live tune (reporting only; shared policy, fed by the libmpv bridge's observed facts). */
+    private val decodeHealth = com.nuvio.app.core.analytics.DecodeHealthReporter(platform = "tvos")
     /** The bounded retry of a live channel whose first open failed with a 5xx / unreachable (the phone's onOpenFailed). */
     private val openRetry = TvLiveOpenRetry()
     private var openRetryJob: kotlinx.coroutines.Job? = null
@@ -521,6 +526,8 @@ class TvPlayerSession(
         if (displayModeSwitching == inProgress) return
         displayModeSwitching = inProgress
         if (!inProgress) monitor = TvLiveMonitor()
+        // The deliberate gap is not a frozen picture: restart the decode-health clocks around it.
+        decodeHealth.onDisruption()
         log.i { "display mode switch ${if (inProgress) "started" else "settled"}" }
     }
 
@@ -985,6 +992,7 @@ class TvPlayerSession(
             playbackSpeed = b.getPlaybackSpeed(),
             videoProgressTicks = b.getVideoFrameTicks(),
             hasVideoTrack = true,
+            decodeHealth = b.decodeHealthSignals(),
         )
         serverPlaybackUrl?.let {
             ServerPlayback.onPlaybackSnapshot(it, snapshot.positionMs, snapshot.isPlaying, snapshot.isLoading, snapshot.isEnded)
@@ -1048,6 +1056,16 @@ class TvPlayerSession(
             val sampled = if (TvLiveRelinkPolicy.isStaleEnd(snapshot.isEnded, sinceFreshOpen)) {
                 snapshot.copy(isEnded = false, isLoading = true)
             } else snapshot
+            if (liveTune && !displayModeSwitching) {
+                decodeHealth.onLiveSnapshot(
+                    snapshot = snapshot,
+                    // Observed copies only (DecodeHealthShadow): no synchronous mpv read, so safe on Main on every zap.
+                    streamInfo = { b.decodeHealthStreamInfo() },
+                    streamUrl = activeSourceUrl,
+                    contentId = sessionVideoId,
+                    surface = "player",
+                )
+            }
             if (!displayModeSwitching) when (monitor.sample(now, sampled, wantsToPlay)) {
                 TvLiveAction.None -> Unit
                 TvLiveAction.Reconnect -> { log.i { "live freeze: reconnecting" }; publishReconnectAttempt(); reconnectLive() }

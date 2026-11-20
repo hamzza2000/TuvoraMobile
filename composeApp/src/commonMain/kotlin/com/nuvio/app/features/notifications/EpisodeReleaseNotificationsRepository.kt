@@ -4,6 +4,7 @@ package com.nuvio.app.features.notifications
 
 import co.touchlab.kermit.Logger
 import com.nuvio.app.core.contracts.ShowAlertBellMirrorAccess
+import com.nuvio.app.core.deeplink.buildHomeDeepLinkUrl
 import com.nuvio.app.core.deeplink.buildMetaDeepLinkUrl
 import com.nuvio.app.features.addons.AddonRepository
 import com.nuvio.app.features.details.MetaDetailsRepository
@@ -126,11 +127,12 @@ object EpisodeReleaseNotificationsRepository {
         scope.launch {
             val now = Clock.System.now()
             val authorized = runCatching { EpisodeReleaseNotificationPlatform.notificationsAuthorized() }.getOrDefault(false)
+            val awayOn = AwayReminderPolicy.effective(preferences.awayReminder, authorized, _uiState.value.isEnabled) != AwayReminder.Off
             runtime = AlertAftermath.onAppOpened(
                 runtime = runtime,
                 now = now,
                 zone = TimeZone.currentSystemDefault(),
-                alertsCouldHaveFired = _uiState.value.isEnabled && authorized,
+                alertsCouldHaveFired = (_uiState.value.isEnabled || awayOn) && authorized,
             )
             persistRuntime()
             runCatching { EpisodeReleaseNotificationPlatform.recordAppOpened(now.toEpochMilliseconds()) }
@@ -214,6 +216,8 @@ object EpisodeReleaseNotificationsRepository {
                 persistRuntime()
                 persist()
                 publish()
+                // Only the episode alerts are off: a "Remind me what's new" the viewer chose is scheduled again.
+                refreshScheduledNotifications()
                 return@launch
             }
 
@@ -243,6 +247,7 @@ object EpisodeReleaseNotificationsRepository {
                 log.e(error) { "Failed to request episode release notification permission" }
             }
             .getOrDefault(false)
+        markPermissionAsked()
 
         if (!granted) {
             _uiState.value = _uiState.value.copy(
@@ -295,6 +300,39 @@ object EpisodeReleaseNotificationsRepository {
 
     fun setDontAskAgain(value: Boolean) = updatePreferences { it.copy(dontAskAgain = value) }
 
+    /** "Remind me what's new". Any pick, Off included, is a choice that beats the default from then on. */
+    fun setAwayReminder(choice: AwayReminder) {
+        updatePreferences { it.copy(awayReminder = choice) }
+        // The choice is stored either way; a permission not asked yet is asked for now, like the episode switch does.
+        if (AwayGroupPolicy.shouldAskOnPick(choice, _uiState.value.osPermission)) {
+            scope.launch { askPermissionForAwayReminder() }
+        }
+    }
+
+    private suspend fun askPermissionForAwayReminder() {
+        if (!permissionMutex.tryLock()) return
+        try {
+            val granted = runCatching { EpisodeReleaseNotificationPlatform.requestAuthorization() }
+                .onFailure { error -> log.e(error) { "Failed to request notification permission" } }
+                .getOrDefault(false)
+            markPermissionAsked()
+            _uiState.value = _uiState.value.copy(
+                permissionGranted = granted,
+                permissionDenied = _uiState.value.isEnabled && !granted,
+            )
+            publish()
+            if (granted) refreshScheduledNotifications()
+        } finally {
+            permissionMutex.unlock()
+        }
+    }
+
+    private fun markPermissionAsked() {
+        if (runtime.permissionAsked) return
+        runtime = runtime.copy(permissionAsked = true)
+        persistRuntime()
+    }
+
     /** Forgets what was learned about when this phone is used: "Learning again" until there is enough history. */
     fun resetLearnedTime() {
         ensureLoaded()
@@ -339,6 +377,8 @@ object EpisodeReleaseNotificationsRepository {
 
     /** Flips one show's switch. Quiet: never asks for the OS permission. Mirrors the Calendar's bell. */
     fun setShowAlert(contentType: String, contentId: String, title: String?, on: Boolean) {
+        // A live channel or movie has no episodes: it is never enrolled, and its bell is never set.
+        if (!TrackedShows.isTrackable(contentType, contentId)) return
         ensureLoaded()
         val key = buildTrackedShowKey(contentType, contentId)
         val existing = trackedShowsByKey[key]
@@ -358,6 +398,7 @@ object EpisodeReleaseNotificationsRepository {
 
     /** The viewer asked for alerts on this show: turn it on, and the master switch too (asking permission now). */
     fun requestShowAlert(contentType: String, contentId: String, title: String?) {
+        if (!TrackedShows.isTrackable(contentType, contentId)) return
         ensureLoaded()
         setShowAlert(contentType, contentId, title, on = true)
         if (_uiState.value.isEnabled) return
@@ -376,7 +417,7 @@ object EpisodeReleaseNotificationsRepository {
     /** Whether the end-of-episode prompt may appear for this show now. [nextEpisodeAired] is null with no later episode. */
     fun shouldOfferEndOfEpisodePrompt(contentType: String, contentId: String, nextEpisodeAired: Boolean?): Boolean {
         ensureLoaded()
-        if (!isSeriesLibraryType(contentType)) return false
+        if (!TrackedShows.isTrackable(contentType, contentId)) return false
         val state = _uiState.value
         return EndOfEpisodePromptPolicy.shouldOffer(
             dontAskAgain = preferences.dontAskAgain,
@@ -410,6 +451,7 @@ object EpisodeReleaseNotificationsRepository {
                     log.e(error) { "Failed to request permission for test notification" }
                 }
                 .getOrDefault(false)
+            markPermissionAsked()
 
             if (!granted) {
                 _uiState.value = _uiState.value.copy(
@@ -475,11 +517,15 @@ object EpisodeReleaseNotificationsRepository {
                 }.getOrNull()
             }
 
+        // Older installs stored live channels here (a favourite put them in the Library as type "tv"): prune them.
+        val storedShows = stored?.followedShows.orEmpty()
+        val keptShows = TrackedShows.prune(storedShows)
         trackedShowsByKey = buildMap {
-            stored?.followedShows.orEmpty().forEach { trackedShow ->
+            keptShows.forEach { trackedShow ->
                 put(buildTrackedShowKey(trackedShow.contentType, trackedShow.contentId), trackedShow)
             }
         }
+        val prunedStored = keptShows.size != storedShows.size
         preferences = stored?.preferences?.toModel() ?: AlertPreferences()
         promptedShowKeys = stored?.promptedShowKeys.orEmpty().toSet()
         runtime = loadAux<StoredAlertRuntime>(runtimeAuxName) ?: StoredAlertRuntime()
@@ -492,6 +538,7 @@ object EpisodeReleaseNotificationsRepository {
             testTargetTitle = null,
             errorMessage = null,
         )
+        if (prunedStored) persist()
         publish()
     }
 
@@ -539,6 +586,7 @@ object EpisodeReleaseNotificationsRepository {
         }
         _uiState.value = _uiState.value.copy(
             learningAgain = runtime.learningAgain && ready == null,
+            permissionAsked = runtime.permissionAsked,
             preferences = preferences,
             habitSessions = (habit as? WatchHabitPolicy.Habit.StillLearning)?.sessions
                 ?: WatchHabitPolicy.sessionsOf(ViewingHistory.parse(viewingStarts)).size,
@@ -550,39 +598,42 @@ object EpisodeReleaseNotificationsRepository {
             ).let { it.hour * 60 + it.minute },
             quietConflict = AlertTimingExplainer.conflict(habit, preferences),
             sendingLessOften = BackOff.effective(preferences.cap, streak).tightened,
-            shows = trackedShowsByKey.values
-                .map { show ->
-                    ShowAlertRow(
-                        contentType = show.contentType,
-                        contentId = show.contentId,
-                        title = show.title?.takeIf { it.isNotBlank() } ?: show.contentId,
-                        on = showIsOn(show),
-                    )
-                }
-                .sortedBy { it.title.lowercase() },
+            shows = TrackedShows.rows(trackedShowsByKey.values, ::showIsOn),
         )
         _revision.value = _revision.value + 1
     }
 
-    private suspend fun syncAuthorizationState(refreshIfEnabled: Boolean) {
+    /** The page resumed (or the app came back from system settings): re-read the OS permission. No network. */
+    fun refreshPermissionState() {
+        ensureLoaded()
+        scope.launch { syncAuthorizationState(refreshIfEnabled = false, rescheduleWhenRegranted = true) }
+    }
+
+    private suspend fun syncAuthorizationState(refreshIfEnabled: Boolean, rescheduleWhenRegranted: Boolean = false) {
         val granted = runCatching { EpisodeReleaseNotificationPlatform.notificationsAuthorized() }
             .onFailure { error ->
                 log.w { "Failed to read episode release notification permission: ${error.message}" }
             }
             .getOrDefault(false)
 
-        _uiState.value = _uiState.value.copy(
-            permissionGranted = granted,
-            permissionDenied = _uiState.value.isEnabled && !granted,
+        val before = _uiState.value
+        val view = NotificationPermissionPolicy.reconcile(
+            isEnabled = before.isEnabled,
+            granted = granted,
+            currentError = before.errorMessage,
+            disabledMessage = getString(Res.string.settings_notifications_permission_disabled),
+        )
+        _uiState.value = before.copy(
+            permissionGranted = view.granted,
+            permissionDenied = view.denied,
             testTargetTitle = currentTestTarget()?.name,
-            errorMessage = when {
-                _uiState.value.isEnabled && !granted -> runBlocking { getString(Res.string.settings_notifications_permission_disabled) }
-                else -> _uiState.value.errorMessage
-            },
+            errorMessage = view.errorMessage,
         )
         _revision.value = _revision.value + 1
 
-        if (refreshIfEnabled && _uiState.value.isEnabled) {
+        val reschedule = refreshIfEnabled && _uiState.value.isEnabled ||
+            rescheduleWhenRegranted && NotificationPermissionPolicy.shouldReschedule(before.permissionGranted, granted, before.isEnabled)
+        if (reschedule) {
             refreshScheduledNotifications()
         }
     }
@@ -591,39 +642,13 @@ object EpisodeReleaseNotificationsRepository {
         ShowAlertDefaults.isOn(show.alertsOn, FollowSource.fromWire(show.source))
 
     private fun reconcileTrackedShows(state: LibraryUiState, progress: WatchProgressUiState): Boolean {
-        if (!state.isLoaded) return false
-
-        val nextTrackedShows = linkedMapOf<String, TrackedFollowedShow>()
-
-        state.items.filter { item -> isSeriesLibraryType(item.type) }.forEach { item ->
-            val key = buildTrackedShowKey(item.type, item.id)
-            val existing = trackedShowsByKey[key]
-            nextTrackedShows[key] = (existing ?: TrackedFollowedShow(
-                contentId = item.id,
-                contentType = item.type,
-                followedOnIsoDate = inferFollowedOnIsoDate(item),
-            )).copy(title = item.name.ifBlank { existing?.title }, source = FollowSource.Library.wire)
-        }
-
-        // Series being watched, whether or not they are saved. They are listed with their switch off until the
-        // viewer turns one on (see ShowAlertDefaults).
-        progress.entries
-            .filter { entry -> isSeriesLibraryType(entry.parentMetaType) && entry.parentMetaId !in progress.hiddenContentIds }
-            .forEach { entry ->
-                val key = buildTrackedShowKey(entry.parentMetaType, entry.parentMetaId)
-                if (key in nextTrackedShows) return@forEach
-                val existing = trackedShowsByKey[key]
-                nextTrackedShows[key] = (existing ?: TrackedFollowedShow(
-                    contentId = entry.parentMetaId,
-                    contentType = entry.parentMetaType,
-                    followedOnIsoDate = CurrentDateProvider.todayIsoDate(),
-                )).copy(title = entry.title.ifBlank { existing?.title }, source = FollowSource.ContinueWatching.wire)
-            }
-
-        // A show the viewer switched on stays, even if it has left both lists: dropping it would silently end alerts.
-        trackedShowsByKey.forEach { (key, show) ->
-            if (key !in nextTrackedShows && show.alertsOn == true) nextTrackedShows[key] = show
-        }
+        val nextTrackedShows = TrackedShows.reconcile(
+            existing = trackedShowsByKey,
+            library = state,
+            progress = progress,
+            today = CurrentDateProvider.todayIsoDate(),
+            followedOn = ::inferFollowedOnIsoDate,
+        ) ?: return false
 
         val changed = nextTrackedShows != trackedShowsByKey
         if (changed) {
@@ -657,7 +682,10 @@ object EpisodeReleaseNotificationsRepository {
                 }
                 .getOrDefault(false)
 
-            if (!_uiState.value.isEnabled || !permissionGranted) {
+            // The away reminder is its own choice: it needs the OS permission but not the episode-alert switch.
+            val episodeAlertsOn = _uiState.value.isEnabled
+            val awayDays = AwayReminderPolicy.effective(preferences.awayReminder, permissionGranted, episodeAlertsOn).days
+            if ((!episodeAlertsOn && awayDays == 0) || !permissionGranted) {
                 runCatching { EpisodeReleaseNotificationPlatform.clearScheduledEpisodeReleaseNotifications() }
                     .onFailure { error ->
                         log.w { "Failed to clear scheduled episode release notifications: ${error.message}" }
@@ -720,18 +748,42 @@ object EpisodeReleaseNotificationsRepository {
             val zone = TimeZone.currentSystemDefault()
             val now = Clock.System.now()
             val habit = WatchHabitPolicy.learn(ViewingHistory.parse(viewingStarts), now.toLocalDateTime(zone).date)
-            val planned = NotificationGatePolicy.plan(
-                GateInput(
+            val times = preferences.timesFor(habit)
+            val openedDates = runtime.openedDates.mapNotNull(::parseIsoDate).toSet()
+            val sentDates = runtime.sentDates.mapNotNull(::parseIsoDate).toSet()
+            val planned = if (episodeAlertsOn) {
+                NotificationGatePolicy.plan(
+                    GateInput(
+                        now = now,
+                        zone = zone,
+                        candidates = candidates,
+                        times = times,
+                        quietHours = preferences.quietHours,
+                        cap = preferences.cap,
+                        openedDates = openedDates,
+                        sentDates = sentDates,
+                        ignoredStreak = runtime.ignoredStreak,
+                        backOffNoticeShown = runtime.backOffNoticeShown,
+                    ),
+                )
+            } else {
+                emptyList()
+            }
+            val away = AwayReminderPolicy.plan(
+                AwayReminderInput(
                     now = now,
                     zone = zone,
+                    awayDays = awayDays,
+                    lastOpenedAt = runtime.lastOpenedAtMs.takeIf { it > 0L }?.let { Instant.fromEpochMilliseconds(it) },
                     candidates = candidates,
-                    times = preferences.timesFor(habit),
+                    times = times,
                     quietHours = preferences.quietHours,
                     cap = preferences.cap,
-                    openedDates = runtime.openedDates.mapNotNull(::parseIsoDate).toSet(),
-                    sentDates = runtime.sentDates.mapNotNull(::parseIsoDate).toSet(),
+                    openedDates = openedDates,
+                    sentDates = sentDates,
                     ignoredStreak = runtime.ignoredStreak,
                     backOffNoticeShown = runtime.backOffNoticeShown,
+                    episodeAlerts = planned,
                 ),
             )
 
@@ -752,21 +804,37 @@ object EpisodeReleaseNotificationsRepository {
                 )
             }
 
+            val awayRequest = away?.let { reminder ->
+                val content = AwayReminderContentBuilder.build(reminder, ResourceAwayTemplates)
+                EpisodeReleaseNotificationRequest(
+                    requestId = "away-reminder-$profileId",
+                    notificationTitle = content.title,
+                    notificationBody = content.body,
+                    releaseDateIso = reminder.fireDate.toString(),
+                    deepLinkUrl = buildHomeDeepLinkUrl(),
+                    fireAtEpochMs = reminder.fireAt.toEpochMilliseconds(),
+                    quietHours = preferences.quietHours,
+                    isAwayReminder = true,
+                )
+            }
+
             runCatching {
-                EpisodeReleaseNotificationPlatform.scheduleEpisodeReleaseNotifications(requests)
+                EpisodeReleaseNotificationPlatform.scheduleEpisodeReleaseNotifications(requests + listOfNotNull(awayRequest))
             }.onFailure { error ->
                 log.e(error) { "Failed to schedule episode release notifications" }
             }
 
             runtime = runtime.copy(
-                scheduled = planned.map { ScheduledAlertRecord(it.fireAt.toEpochMilliseconds(), it.sendingLessNotice) },
+                // The reminder is recorded like an alert: a sent one counts toward the cap, an unopened one toward back-off.
+                scheduled = planned.map { ScheduledAlertRecord(it.fireAt.toEpochMilliseconds(), it.sendingLessNotice) } +
+                    listOfNotNull(away?.let { ScheduledAlertRecord(it.fireAt.toEpochMilliseconds(), it.sendingLessNotice) }),
             )
             persistRuntime()
 
             _uiState.value = _uiState.value.copy(
                 isLoading = false,
                 permissionGranted = true,
-                scheduledCount = requests.size,
+                scheduledCount = planned.size,
                 testTargetTitle = currentTestTarget()?.name,
                 errorMessage = null,
             )
@@ -785,8 +853,7 @@ object EpisodeReleaseNotificationsRepository {
     private fun currentTestTarget(): LibraryItem? {
         LibraryRepository.ensureLoaded()
         val libraryItems = LibraryRepository.uiState.value.items
-        return libraryItems.firstOrNull { item -> isSeriesLibraryType(item.type) }
-            ?: libraryItems.firstOrNull()
+        return TrackedShows.testTarget(libraryItems)
     }
 
     private suspend fun buildCandidatesForShow(trackedShow: TrackedFollowedShow): List<AlertCandidate> {
@@ -844,5 +911,17 @@ private object ResourceAlertTemplates : AlertTemplates {
         getString(Res.string.notifications_alert_body_list, labels.joinToString(", "))
     override suspend fun listBodyWithMore(labels: List<String>, more: Int) =
         getString(Res.string.notifications_alert_body_list_more, labels.joinToString(", "), more)
+    override suspend fun lessOftenLine() = getString(Res.string.notifications_alert_less_often)
+}
+
+/** Real words for [AwayTemplates], from the app's string resources. */
+private object ResourceAwayTemplates : AwayTemplates {
+    override suspend fun titleOne() = getString(Res.string.notifications_away_title_one)
+    override suspend fun titleMany(showCount: Int) = getString(Res.string.notifications_away_title_many, showCount)
+    override suspend fun bodyNames(first: String, second: String?) = getString(
+        Res.string.notifications_away_body_names,
+        if (second == null) first else getString(Res.string.notifications_away_names_two, first, second),
+    )
+    override suspend fun bodyCount() = getString(Res.string.notifications_away_body_count)
     override suspend fun lessOftenLine() = getString(Res.string.notifications_alert_less_often)
 }
