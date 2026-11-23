@@ -5,6 +5,7 @@ import android.app.ApplicationExitInfo
 import android.content.Context
 import android.os.Build
 import android.os.Debug
+import android.os.Process
 import com.nuvio.app.core.build.AppVersionConfig
 import com.nuvio.app.core.telemetry.api.TelemetryAccess
 import java.io.InputStream
@@ -25,6 +26,7 @@ object AppExitReporter {
 
     private const val PREFS = "app_exit_reporter"
     private const val KEY_LAST_SEEN_TS = "last_seen_exit_ts"
+    private const val KEY_SELF_EXIT = "self_exit_marker_v1"
     private const val KEY_SEEN_EXIT_IDS = "seen_exit_ids_v2"
     private const val KEY_RUN_STARTS = "run_starts_v2"
     private const val KEY_CURRENT_RUN_START = "current_run_start_v2"
@@ -41,6 +43,37 @@ object AppExitReporter {
     private const val TRACE_SCAN_CHARS = 120_000
     private const val PROCESS_SAMPLE_INTERVAL_SECONDS = 30L
     private val lock = Any()
+
+    /** Guards the self-exit marker's write and the report's read-compare-clear; separate from [lock] so the
+     *  deliberate-exit path never waits on breadcrumb or sampler writes. */
+    private val markerLock = Any()
+
+    /** Set by [attachContext]; lets deliberate-exit call sites mark without threading a Context through. */
+    @Volatile
+    private var appContext: Context? = null
+
+    /**
+     * Call first thing in Application.onCreate, regardless of consent: consent can be turned on mid-session, and
+     * [markSelfExit] from a context-less call site (platformExitApp) must still be able to write the marker. A plain
+     * assignment, no I/O.
+     */
+    fun attachContext(context: Context) {
+        appContext = context.applicationContext ?: context
+    }
+
+    /**
+     * Call immediately before a deliberate self-kill (user Exit, restart, icon change). Written with `commit()`: an
+     * `apply()` is asynchronous and would be lost to the SIGKILL that follows. Never throws.
+     */
+    fun markSelfExit(context: Context?, tag: String) {
+        runCatching {
+            val ctx = (context?.applicationContext ?: appContext) ?: return
+            val raw = SelfExitMarker.encode(tag, Process.myPid(), System.currentTimeMillis()) ?: return
+            synchronized(markerLock) {
+                ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(KEY_SELF_EXIT, raw).commit()
+            }
+        }
+    }
     private val diagnosticsSampler = Executors.newSingleThreadScheduledExecutor { runnable ->
         Thread(runnable, "AppDiagnosticsSampler").apply { isDaemon = true }
     }
@@ -62,6 +95,7 @@ object AppExitReporter {
     fun reportPendingExits(context: Context) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
         val appContext = context.applicationContext
+        attachContext(appContext)
 
         // Snapshot the new run immediately, before it can fail. The binder query and trace reads
         // remain off the main thread and can never delay startup.
@@ -151,6 +185,24 @@ object AppExitReporter {
 
     private fun doReport(context: Context) {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val rawMarker = synchronized(markerLock) { prefs.getString(KEY_SELF_EXIT, null) }
+        var completed = false
+        try {
+            doReport(context, prefs, SelfExitMarker.decode(rawMarker))
+            completed = true
+        } finally {
+            // Consumed: one marker explains at most one earlier process. Compare-and-clear under the marker lock so a
+            // marker written meanwhile by markSelfExit (Exit pressed mid-report) is never deleted.
+            synchronized(markerLock) {
+                val storedNow = prefs.getString(KEY_SELF_EXIT, null)
+                if (SelfExitMarker.shouldClearAfterReport(rawMarker, storedNow, Process.myPid(), completed)) {
+                    prefs.edit().remove(KEY_SELF_EXIT).commit()
+                }
+            }
+        }
+    }
+
+    private fun doReport(context: Context, prefs: android.content.SharedPreferences, selfExitMarker: SelfExitMarker?) {
         val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
         val exits = activityManager.getHistoricalProcessExitReasons(
             context.packageName,
@@ -177,14 +229,21 @@ object AppExitReporter {
                 )
                 if (exitId in seenIds) return@forEach
 
-                // Drop normal OS lifecycle (e.g. a cached/background process SIGKILLed to reclaim RAM)
-                // so it does not skew crash metrics — only report app faults and user-visible reclaims.
-                // The end-of-loop timestamp advance below still moves past the skipped record.
-                if (!AppExitReportPolicy.shouldReport(reason, exit.importance)) {
+                // Classification is pure (AppExitReportPolicy): our own tagged kill is counted, a cached/background
+                // reclaim is dropped, everything else reports. The end-of-loop timestamp advance below still moves
+                // past the skipped records.
+                val selfTag = SelfExitMarker.tagFor(selfExitMarker, exit.pid, exit.timestamp)
+                val outcome = AppExitReportPolicy.classify(reason, exit.importance, selfTag)
+                if (outcome is AppExitReportPolicy.Outcome.CountOnly) {
+                    TelemetryAccess.current().emit("app_exit", mapOf("reason" to "self_exit", "kind" to outcome.tag))
+                    return@forEach
+                }
+                if (outcome is AppExitReportPolicy.Outcome.Drop) {
                     // Background reclaims are no longer silent: the send policy counts them in session_health.
                     TelemetryAccess.current().emit("app_exit", mapOf("reason" to reason, "importance" to exit.importance))
                     return@forEach
                 }
+                val promote = (outcome as AppExitReportPolicy.Outcome.Report).promote
 
                 val failedRun = findRunContext(exit.timestamp, runContexts)
                 val properties = buildProperties(context, exit, reason, failedRun)
@@ -194,7 +253,7 @@ object AppExitReporter {
                     TelemetryAccess.current().previousSessionTrail()?.let { properties + ("diag_trail" to it) } ?: properties
                 } else properties
                 TelemetryAccess.current().emit("app_exit", withTrail)
-                if (shouldPromoteProcessExitToIssue(reason, exit.importance)) {
+                if (promote) {
                     captureExitIssue(reason, properties)
                 }
 
