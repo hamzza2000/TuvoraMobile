@@ -33,6 +33,11 @@ struct SportsScreen: View {
     @State private var gameFallback: RadarFixture?
     @State private var pendingPlay: TvPlayerSession?
     @State private var smokeMatchOpened = false
+    /// Sports alerts: a banner's "Open game" arrives here; the hub header carries the Alerts on / off chip.
+    @ObservedObject private var alerts = SportsAlertCenter.shared
+    @State private var alertsSignedIn = TvSportsAlerts.shared.signedIn.value.boolValue
+    /// The current "Open game" request's wait (the phone's OpenGameRequestPolicy: open, wait, or drop once the load finished).
+    @State private var gameRequestWaiter = OpenGameRequestPolicy.Waiter()
 
     var body: some View {
         Group {
@@ -55,6 +60,7 @@ struct SportsScreen: View {
             for await next in TvSports.shared.state {
                 radar = next
                 now = TvSports.shared.nowMs()
+                consumeGameRequest(next)
                 smokeLog("SMOKE sports follows=%d fixtures=%d loading=%d", next.follows.count, next.fixturesByLeague.count, next.loadingFixtures)
                 // Simulator smoke hook: `-smokeSportsMatch` opens the first upcoming match's channel sheet.
                 // `-smokeSportsLeague <leagueId>` opens a league page.
@@ -78,6 +84,26 @@ struct SportsScreen: View {
                 now = TvSports.shared.nowMs()
             }
         }
+        .task(id: radar.flatMap { TvSports.shared.nextScoreChangeAtMs(state: $0, nowMs: now)?.int64Value }) {
+            // Score delay: ONE local redraw when the next delayed score falls due (no polling, no request).
+            guard let radar, let due = TvSports.shared.nextScoreChangeAtMs(state: radar, nowMs: TvSports.shared.nowMs())?.int64Value else { return }
+            let wait = max(due - TvSports.shared.nowMs(), 0) + 50
+            try? await Task.sleep(nanoseconds: UInt64(wait) * 1_000_000)
+            if !Task.isCancelled { now = TvSports.shared.nowMs() }
+        }
+        // A banner's "Open game" while the hub is already up (the state loop above handles it on the next emission too).
+        .onChange(of: alerts.pendingGameId) { _, _ in
+            gameRequestWaiter = OpenGameRequestPolicy.Waiter()
+            if let radar { consumeGameRequest(radar) }
+        }
+        .task(id: alerts.pendingGameId) {
+            // Bounded: a request the hub's load never satisfies is dropped, never opened late and unprompted.
+            guard let id = alerts.pendingGameId else { return }
+            try? await Task.sleep(nanoseconds: Self.gameRequestDeadlineNs)
+            if !Task.isCancelled, alerts.pendingGameId == id { alerts.pendingGameId = nil }
+        }
+        .task { for await value in TvSportsAlerts.shared.signedIn { alertsSignedIn = value.boolValue } }
+        // Gate 3 (the game page is up) is reported by GameDetailScreen itself, on its own appear / disappear.
         .task(id: scenePhase) {
             // Egress rule: the refresh loop lives only while Sports is on screen and the app is
             // active; leaving the tab or backgrounding cancels this task and with it the loop.
@@ -123,6 +149,26 @@ struct SportsScreen: View {
         }
     }
 
+    /// The phone's OpenGameRequestPolicy.TTL_MS (15 s).
+    private static let gameRequestDeadlineNs: UInt64 = 15_000_000_000
+
+    /// A banner's "Open game": opens the game once the hub holds its fixture; dropped once the hub's load has
+    /// FINISHED without it (seen loading, then not), never merely because nothing is loading at this instant
+    /// (the phone's OpenGameRequestPolicy), so a game never opens late and unprompted.
+    private func consumeGameRequest(_ state: RadarUiState) {
+        guard let id = alerts.pendingGameId else { return }
+        let fixture = TvSportsAlerts.shared.fixtureFor(eventId: id)
+        let outcome = gameRequestWaiter.observe(found: fixture != nil, loading: state.loadingFixtures)
+        if outcome == .open, let fixture {
+            alerts.pendingGameId = nil
+            leaguePage = nil
+            page = nil
+            open(fixture)
+        } else if outcome == .drop {
+            alerts.pendingGameId = nil
+        }
+    }
+
     /// OK on a match opens the live game screen; it hands over to the channel sheet when it has no data.
     private func open(_ fixture: RadarFixture) {
         // A fixture the game screen can't open (no event id / kick-off) goes straight to the channel sheet.
@@ -133,9 +179,26 @@ struct SportsScreen: View {
     private func hub(_ radar: RadarUiState, _ hub: TvSportsHub) -> some View {
         ScrollView(.vertical, showsIndicators: false) {
             LazyVStack(alignment: .leading, spacing: dp(24)) {
-                Text("Sports").font(NuvioType.headlineSmall).foregroundStyle(colors.textPrimary)
-                    .padding(.leading, SportsMetrics.gutter)
-                    .padding(.bottom, dp(12) - dp(24))
+                let spoiler = TvSports.shared.scoreSettings(state: radar)
+                HStack(spacing: dp(12)) {
+                    Text("Sports").font(NuvioType.headlineSmall).foregroundStyle(colors.textPrimary)
+                    Spacer()
+                    ScoreChip(label: spoiler.toggleLabel, systemImage: spoiler.shown ? "eye" : "eye.slash") {
+                        TvSports.shared.toggleScoresShown()
+                    }
+                    if spoiler.shown {
+                        ScoreChip(label: spoiler.delayLabel, systemImage: "timer") { TvSports.shared.cycleScoreDelay() }
+                    }
+                    // `Alerts on` / `Alerts off`; signed out it reads `Sign in for alerts` and can't take focus.
+                    let alertChip = TvSportsAlerts.shared.hubChip()
+                    ScoreChip(label: alertChip.label, systemImage: alertChip.selected ? "bell" : "bell.slash",
+                              enabled: alertChip.enabled && alertsSignedIn) {
+                        TvSportsAlerts.shared.toggleEnabled()
+                    }
+                }
+                .focusSection()
+                .padding(.horizontal, SportsMetrics.gutter)
+                .padding(.bottom, dp(12) - dp(24))
 
                 if !hub.featured.isEmpty {
                     VStack(alignment: .leading, spacing: 0) {
@@ -233,6 +296,36 @@ struct SportsScreen: View {
     }
 }
 
+/// Hide scores / Score delay chip: a focusable pill in the hub header (same look as See all, a touch larger).
+private struct ScoreChip: View {
+    let label: String
+    let systemImage: String
+    /// Disabled chips dim and can't take focus (the signed-out alerts chip).
+    var enabled = true
+    let action: () -> Void
+    @Environment(\.nuvio) private var colors
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: dp(6)) {
+                Image(systemName: systemImage)
+                Text(label)
+            }
+            .font(NuvioType.labelMedium)
+            .foregroundStyle(focused ? colors.primary : colors.textSecondary)
+            .padding(.horizontal, dp(14)).padding(.vertical, dp(6))
+            .background(RoundedRectangle(cornerRadius: dp(8)).fill(focused ? colors.focusBackground : colors.backgroundCard))
+            .overlay(RoundedRectangle(cornerRadius: dp(8)).stroke(focused ? colors.focusRing : Color.clear, lineWidth: dp(2)))
+            .opacity(enabled ? 1 : 0.4)
+        }
+        .buttonStyle(PlainNoChromeButtonStyle())
+        .disabled(!enabled)
+        .focused($focused)
+        .reportsFocus(focused)
+    }
+}
+
 private struct IdentifiedItem<ID: Hashable, Item>: Identifiable {
     let id: ID
     let item: Item
@@ -309,12 +402,13 @@ private struct MatchCard: View {
                 }
                 VStack(alignment: .leading, spacing: 0) {
                     if let home = fixture.home, !home.isEmpty, let away = fixture.away, !away.isEmpty {
-                        let homeScore = sports.homeScore(state: radar, fixture: fixture)
-                        let awayScore = sports.awayScore(state: radar, fixture: fixture)
+                        let slots = sports.scoreSlots(state: radar, fixture: fixture, nowMs: sports.nowMs())
+                        let homeScore = slots.home
+                        let awayScore = slots.away
                         TeamRow(name: home, badge: fixture.homeBadge, score: homeScore,
-                                dim: TvSportsHubPolicy.shared.scoreTrails(own: homeScore, other: awayScore))
+                                dim: slots.comparable && TvSportsHubPolicy.shared.scoreTrails(own: homeScore, other: awayScore))
                         TeamRow(name: away, badge: fixture.awayBadge, score: awayScore,
-                                dim: TvSportsHubPolicy.shared.scoreTrails(own: awayScore, other: homeScore))
+                                dim: slots.comparable && TvSportsHubPolicy.shared.scoreTrails(own: awayScore, other: homeScore))
                     } else {
                         Text(fixture.displayTitle).font(NuvioType.inter(14, .semibold)).foregroundStyle(colors.textPrimary).lineLimit(2)
                     }

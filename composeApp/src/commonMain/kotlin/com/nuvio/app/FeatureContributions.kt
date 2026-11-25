@@ -15,6 +15,8 @@ import com.nuvio.app.core.contracts.LiveRecentsAccess
 import com.nuvio.app.core.contracts.LocalStateCleanerRegistry
 import com.nuvio.app.core.contracts.MemoryPortAccess
 import com.nuvio.app.core.contracts.PlaybackGateAccess
+import com.nuvio.app.core.contracts.PlaybackContextAccess
+import com.nuvio.app.core.contracts.PlaybackContextStack
 import com.nuvio.app.core.contracts.ProfileChangeParticipants
 import com.nuvio.app.core.contracts.RecTrackingAccess
 import com.nuvio.app.core.contracts.SyncParticipantRegistry
@@ -97,6 +99,8 @@ fun registerLogicFeatureContributions() {
     ProfileChangeParticipants.register(RadarProfileChange)
     LiveRecentsAccess.register(XtreamLiveRecentsProvider)
     PlaybackGateAccess.register(IptvPlaybackGateAdapter)
+    // What is playing (None / Vod / LiveTv), fed by the player and Live TV routes; read by sports alerts.
+    PlaybackContextAccess.register(PlaybackContextStack())
     LivePlaybackAccess.register(XtreamLivePlaybackProvider)
     // F17: public subtitle ids for IPTV movies/episodes (OpenSubtitles in the IPTV section).
     IptvSubtitleIdAccess.register(XtreamSubtitleIdResolver)
@@ -112,7 +116,7 @@ fun registerLogicFeatureContributions() {
  * history in ANY profile slot, straight from storage (no repository load, no network). The support-code signal is
  * read by the telemetry service itself, before it generates one.
  */
-private object FirstRunExistingInstallProbe {
+internal object FirstRunExistingInstallProbe {
     fun hasUserState(): Boolean = (1..MAX_PROFILES).any { profile ->
         FirstRunInstallSignals.playlistsPresent(XtreamAccountStorage.loadAccountsJson(profile)) ||
             AddonStorage.loadInstalledAddonUrls(profile).isNotEmpty() ||
@@ -199,9 +203,13 @@ private object CalendarSportsAdapter : com.nuvio.app.features.calendar.api.Calen
         com.nuvio.app.features.radar.RadarRepository.uiState
             .distinctUntilChanged { a, b ->
                 a.fixturesByLeague === b.fixturesByLeague && a.fixturesByTeam === b.fixturesByTeam &&
-                    a.liveScores === b.liveScores && a.follows == b.follows && a.teamFollows == b.teamFollows
+                    a.liveScores === b.liveScores && a.follows == b.follows && a.teamFollows == b.teamFollows &&
+                    a.prefs.scoreSpoiler == b.prefs.scoreSpoiler
             }
             .map { }
+
+    override fun nextScoreChangeAtMs(nowMs: Long): Long? =
+        com.nuvio.app.features.radar.RadarRepository.uiState.value.nextScoreChangeAtMs(nowMs)
 }
 
 private object CalendarAccountsAdapter : CalendarAccounts {

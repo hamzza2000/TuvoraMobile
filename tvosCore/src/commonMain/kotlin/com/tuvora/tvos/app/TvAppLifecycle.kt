@@ -24,6 +24,7 @@ import com.nuvio.app.features.profiles.AvatarRepository
 import com.nuvio.app.features.profiles.NuvioProfile
 import com.nuvio.app.features.profiles.ProfileRepository
 import com.nuvio.app.features.profiles.ProfileSwitchController
+import com.nuvio.app.features.radar.alerts.SportsAlerts
 import com.nuvio.app.features.settings.ThemeSettingsRepository
 import com.nuvio.app.features.watched.WatchedRepository
 import com.nuvio.app.features.watchprogress.ContinueWatchingPreferencesRepository
@@ -223,6 +224,9 @@ object TvAppLifecycle {
                 AppForegroundMonitor.events().collectLatest { visibility ->
                     when (visibility) {
                         AppVisibility.Foreground -> {
+                            // First: in-app sports alerts listen only while the app is in front (no polls, no HTTP).
+                            // Started before the pulls below so a slow or throwing step can never leave them off.
+                            SportsAlerts.startForegroundSession()
                             NetworkStatusRepository.requestForegroundRefresh()
                             MemberAccessRepository.refreshIfStale()
                             if (syncProfileId != null) {
@@ -234,12 +238,16 @@ object TvAppLifecycle {
                             runCatching { IptvCatalogAccess.catalog.refreshDuePlaylists() }
                                 .onFailure { if (it is kotlinx.coroutines.CancellationException) throw it }
                         }
-                        AppVisibility.Background -> SyncManager.stopPeriodicNuvioSyncPull()
+                        AppVisibility.Background -> {
+                            SyncManager.stopPeriodicNuvioSyncPull()
+                            SportsAlerts.stopForegroundSession()
+                        }
                     }
                 }
             } finally {
                 SyncManager.stopPeriodicNuvioSyncPull()
                 RealtimeSyncInvalidationService.stop()
+                SportsAlerts.stopForegroundSession()
             }
         }
     }

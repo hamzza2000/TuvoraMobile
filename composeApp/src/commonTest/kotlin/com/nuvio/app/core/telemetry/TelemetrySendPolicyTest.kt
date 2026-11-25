@@ -11,6 +11,15 @@ class TelemetrySendPolicyTest {
     private fun decide(event: String, vararg p: Pair<String, Any>) = TelemetrySendPolicy.decide(event, mapOf(*p))
 
     @Test
+    fun `sports_alert sends shown and actions and counts holds and drops`() {
+        assertEquals(SendDecision.SEND, decide("sports_alert", "outcome" to "shown"))
+        assertEquals(SendDecision.SEND, decide("sports_alert", "outcome" to "action", "action" to "watch"))
+        assertEquals(SendDecision.COUNT, decide("sports_alert", "outcome" to "held", "reason" to "batch"))
+        assertEquals(SendDecision.COUNT, decide("sports_alert", "outcome" to "dropped", "reason" to "quiet_hours"))
+        assertFalse(TelemetrySendPolicy.attachesTrail("sports_alert", mapOf("outcome" to "dropped")))
+    }
+
+    @Test
     fun `screen views stay in the recorder`() = assertEquals(SendDecision.RECORD_ONLY, decide("\$screen"))
 
     @Test
@@ -87,5 +96,16 @@ class TelemetrySendPolicyTest {
         assertEquals(SendDecision.SEND, decide("first_run_step", *props.toList().toTypedArray()))
         assertFalse(TelemetrySendPolicy.attachesTrail("first_run_step", props))
         assertTrue("first_run_step" in TelemetrySendPolicy.explicitSendEvents)
+    }
+
+    @Test
+    fun `first_leave is sent as first_run_step with no trail`() {
+        val props = mapOf<String, Any>(
+            "step" to "first_leave", "schema_version" to 1, "launch_index" to 1, "secs_since_first_launch" to 20,
+            "last_screen" to "tabs.home", "secs_in_app" to 20, "screens_seen" to 2,
+            "opened_source_form" to true, "tried_save" to true, "save_error" to "unreachable",
+        )
+        assertEquals(SendDecision.SEND, decide("first_run_step", *props.toList().toTypedArray()))
+        assertFalse(TelemetrySendPolicy.attachesTrail("first_run_step", props))
     }
 }

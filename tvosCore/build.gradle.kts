@@ -280,10 +280,16 @@ kotlin {
             // Watch party: the shared rules Apple TV's party screen and player sync run on.
             kotlin.srcDir(composeAppSrc.resolve("commonTest/kotlin/com/nuvio/app/features/party"))
             kotlin.srcDir(composeAppSrc.resolve("commonTest/kotlin/com/nuvio/app/features/calendar"))
+            // Screen keep-awake by watch intent (B279): the pure policy Apple TV's player host applies to the idle timer.
+            kotlin.srcDir(composeAppSrc.resolve("commonTest/kotlin/com/nuvio/app/features/player/keepawake"))
+            // Tuvora Connect (B246): the empty-state, play-gate and skip-notice rules Apple TV's sources screen runs on.
+            kotlin.srcDir(composeAppSrc.resolve("commonTest/kotlin/com/nuvio/app/features/servers/managed"))
             // Decode-health telemetry: the pure policy Apple TV's player feeds (kept in its own folder so the rest of core/analytics tests stay out).
             kotlin.srcDir(composeAppSrc.resolve("commonTest/kotlin/com/nuvio/app/core/analytics/decodehealth"))
             // Game screen core (sections, moments, refresh, assembler, strips): the shared rules Apple TV's game screen runs on.
             kotlin.srcDir(composeAppSrc.resolve("commonTest/kotlin/com/nuvio/app/features/sportsdetail"))
+            // In-app sports alerts: the show / hold / drop policy, topics and settings Apple TV's banner runs on.
+            kotlin.srcDir(composeAppSrc.resolve("commonTest/kotlin/com/nuvio/app/features/radar/alerts"))
             // Tests SportsDetailLocals (Compose CompositionLocal wiring), which tvosCore excludes.
             kotlin.exclude("**/SportsDetailAccessTest.kt")
             // Tests a Compose-side helper (CalendarHomeSection.kt) that tvosCore excludes: Apple TV draws the Calendar in SwiftUI.

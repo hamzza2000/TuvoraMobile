@@ -120,6 +120,68 @@ struct RootView: View {
         }
     }
 
+    /// Simulator smoke hook: `-smokeAddXtream <server> <user> <pass>` and/or `-smokeAddStalker <portal> <mac>` add a
+    /// local-guest playlist when the main screen opens (mock portals for device passes), unless one of that name exists.
+    private static var smokeSourcesDone = false
+    private static func smokeAddSources() {
+        let args = AppArguments.list
+        guard !smokeSourcesDone, args.contains("-smokeLocalGuest") else { return }
+        smokeSourcesDone = true
+        func value(_ flag: String, _ n: Int) -> [String]? {
+            guard let i = args.firstIndex(of: flag), i + n < args.count else { return nil }
+            return Array(args[(i + 1)...(i + n)])
+        }
+        func form(_ type: String, _ name: String, server: String = "", user: String = "", pass: String = "", portal: String = "", mac: String = "") -> TvPlaylistForm {
+            TvPlaylistForm(
+                sourceType: type, pasteLink: false, playlistUrl: "", server: server, username: user, password: pass,
+                name: name, userAgent: "", m3uUrl: "", portalUrl: portal, macAddress: mac, stalkerUsername: "",
+                stalkerPassword: "", serialNumber: "", deviceId: "", sendDeviceId: true, deviceId2: "", signature: "",
+                stbModel: "", hwVersion: "", epgUrl: "",
+                autoRefreshHours: TvPlaylistFormPolicy.shared.DEFAULT_AUTO_REFRESH_HOURS, backupUrls: [])
+        }
+        var wanted: [TvPlaylistForm] = []
+        if let x = value("-smokeAddXtream", 3) { wanted.append(form("xtream", "Smoke Xtream", server: x[0], user: x[1], pass: x[2])) }
+        if let s = value("-smokeAddStalker", 2) { wanted.append(form("stalker", "Smoke Stalker", portal: s[0], mac: s[1])) }
+        guard !wanted.isEmpty else { return }
+        TvPlaylists.shared.ensureLoaded()
+        let existing = Set(TvPlaylists.shared.state.value.accounts.map { $0.name })
+        for f in wanted where !existing.contains(f.name) {
+            TvPlaylists.shared.add(form: f) { ok in smokeLog("SMOKE add %@ ok=%d", f.name, ok.boolValue ? 1 : 0) }
+        }
+    }
+
+    /// Simulator smoke hook: `-smokeClearPlaylists` removes every playlist of the (local guest) profile, so a test that
+    /// needs an empty IPTV hub gets one whatever earlier tests added. Local guest only: a signed-in account would sync it.
+    /// Once per launch: the gate task re-runs (and re-delivers `.main`) whenever the gate view reappears, e.g. after
+    /// a full-screen player closes, and a second sweep would delete the playlist the test added.
+    private static var smokeClearDone = false
+    private static func smokeClearPlaylists() {
+        guard !smokeClearDone, AppArguments.list.contains("-smokeClearPlaylists"), AppArguments.list.contains("-smokeLocalGuest") else { return }
+        smokeClearDone = true
+        TvPlaylists.shared.ensureLoaded()
+        Task {
+            for account in TvPlaylists.shared.state.value.accounts { TvPlaylists.shared.remove(accountId: account.id) }
+            smokeLog("SMOKE cleared playlists")
+        }
+    }
+
+    /// Simulator smoke hook: `-smokeSeedProfiles <n>` tops a LOCAL profile set up to n profiles (a guest starts with
+    /// one, and the sidebar's profile switch only exists with 2+). Local-only: createProfile on a guest never syncs.
+    private static var smokeSeedDone = false
+    private static func smokeSeedProfiles() {
+        let args = AppArguments.list
+        guard !smokeSeedDone, let i = args.firstIndex(of: "-smokeSeedProfiles"), i + 1 < args.count, let wanted = Int(args[i + 1]) else { return }
+        smokeSeedDone = true
+        Task {
+            while ProfileRepository.shared.state.value.profiles.count < wanted {
+                let number = ProfileRepository.shared.state.value.profiles.count + 1
+                let made = (try? await ProfileRepository.shared.createProfile(name: "Profile \(number)", avatarColorHex: "#1E88E5", avatarId: nil, avatarUrl: nil, usesPrimaryAddons: false))?.boolValue ?? false
+                smokeLog("SMOKE seed profile %d ok=%d", number, made ? 1 : 0)
+                if !made { break }
+            }
+        }
+    }
+
     private var gate: some View {
         Group {
             switch screen {
@@ -137,7 +199,7 @@ struct RootView: View {
                     try? await Task.sleep(nanoseconds: 2_000_000_000)   // let the add-ons load first
                     smokeSession = session
                 }
-                if next == .main { Self.smokeAddPlaylistLater() }
+                if next == .main { ProfilePickerLaunch.mainReached = true; Self.smokeAddPlaylistLater(); Self.smokeSeedProfiles(); Self.smokeClearPlaylists(); Self.smokeAddSources() }
                 screen = next
                 TvAppGraph.shared.screenChanged(name: "tv_gate_\(next)")
             }

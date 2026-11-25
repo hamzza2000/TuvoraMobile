@@ -51,6 +51,11 @@ struct TvPlayerScreen: View {
     @FocusState private var startOverFocused: Bool
     /// This screen holds Live TV for display frame-rate matching (LiveDisplayCriteriaController).
     @State private var holdsLiveDisplay = false
+    /// B279: the app is not the active scene, so the screen hold is released (PlaybackKeepAwakePolicy).
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var appInBackground = false
+    /// Mirrors the keep-awake hold for the `player.awake` UI-test marker (B279).
+    @State private var keepAwakeHeld = false
     /// Watch party: the shared party, the player's party line, and the last party message (a few seconds).
     @StateObject private var party = PartyModel()
     @State private var partyLine: String?
@@ -64,6 +69,21 @@ struct TvPlayerScreen: View {
     private var startOverVisible: Bool { (state?.startOverAtMs != nil || state?.serverResumeOfferMs != nil) && panel == nil && overlay == nil }
 
     private var isLive: Bool { state?.isLive ?? false }
+
+    /// B279: hold the screen (and so the screensaver) off by WATCH INTENT, not by the engine's isPlaying: a live
+    /// stall, buffer or reconnect reports "not playing" with no spinner, and libmpv on a CAMetalLayer gets no hold
+    /// from the OS at all. Both lanes go through here; the decision is PlaybackKeepAwakePolicy.
+    private func syncKeepAwake() {
+        let hold = PlaybackKeepAwakePolicy.shared.shouldHold(
+            playIntent: state?.playIntent ?? true,
+            userPaused: !(state?.playIntent ?? true),
+            ended: state?.isEnded ?? false,
+            error: state?.errorMessage != nil,
+            inBackground: appInBackground
+        )
+        if UIApplication.shared.isIdleTimerDisabled != hold { UIApplication.shared.isIdleTimerDisabled = hold }
+        if keepAwakeHeld != hold { keepAwakeHeld = hold }
+    }
 
     /// Bare video: nothing over it that takes focus.
     private var bareVideoFocusable: Bool {
@@ -79,6 +99,15 @@ struct TvPlayerScreen: View {
             .opacity(0.01)
             .allowsHitTesting(false)
             .accessibilityIdentifier("player.now")
+    }
+
+    /// UI-test marker (B279): whether the screen is held awake right now ("awake=1") or may sleep ("awake=0").
+    private var awakeMarker: some View {
+        Text("awake=\(keepAwakeHeld ? 1 : 0)")
+            .font(.system(size: 1))
+            .opacity(0.01)
+            .allowsHitTesting(false)
+            .accessibilityIdentifier("player.awake")
     }
 
     /// UI-test marker: whole seconds played, and whether a scrub preview is up ("12|scrub").
@@ -109,6 +138,7 @@ struct TvPlayerScreen: View {
             .disabled(!bareVideoFocusable)
             .accessibilityIdentifier("player.video")
             nowMarker
+            awakeMarker
             positionMarker
             #if DEBUG
             RemoteTrailMarker()
@@ -200,6 +230,7 @@ struct TvPlayerScreen: View {
             relay?.action = { remoteAction($0) }
             relay?.handler = { handle($0) }
             session.attach()
+            syncKeepAwake()
             bumpControls()
             if session.state.value.isLive && !holdsLiveDisplay {
                 holdsLiveDisplay = true
@@ -254,6 +285,7 @@ struct TvPlayerScreen: View {
         }
         .onDisappear {
             session.detach()
+            UIApplication.shared.isIdleTimerDisabled = false
             if holdsLiveDisplay {
                 holdsLiveDisplay = false
                 LiveDisplayCriteriaController.shared.exit()
@@ -291,6 +323,21 @@ struct TvPlayerScreen: View {
         .animation(NuvioTokens.Motion.overlay, value: panel)
         .animation(NuvioTokens.Motion.overlay, value: overlay)
         .animation(NuvioTokens.Motion.fast, value: skipVisible)
+        .onChange(of: state?.playIntent) { _, _ in syncKeepAwake() }
+        .onChange(of: state?.isEnded) { _, _ in syncKeepAwake() }
+        .onChange(of: state?.errorMessage) { _, _ in syncKeepAwake() }
+        .onChange(of: scenePhase) { _, phase in
+            appInBackground = phase == .background
+            syncKeepAwake()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in
+            appInBackground = true
+            syncKeepAwake()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
+            appInBackground = false
+            syncKeepAwake()
+        }
         .onChange(of: skipVisible) { _, visible in
             // NuvioTV requests focus for the button when it appears over hidden controls.
             if visible && !controlsVisible { DispatchQueue.main.async { skipFocused = true } }
