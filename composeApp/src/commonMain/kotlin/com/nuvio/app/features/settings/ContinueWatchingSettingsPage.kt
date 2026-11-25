@@ -37,6 +37,10 @@ import com.nuvio.app.features.watchprogress.ContinueWatchingPreferencesRepositor
 import com.nuvio.app.features.watchprogress.ContinueWatchingSectionStyle
 import com.nuvio.app.features.watchprogress.ContinueWatchingSortMode
 import nuvio.composeapp.generated.resources.Res
+import nuvio.composeapp.generated.resources.settings_continue_watching_order_recent
+import nuvio.composeapp.generated.resources.settings_continue_watching_order_recent_desc
+import nuvio.composeapp.generated.resources.settings_continue_watching_order_resume_first
+import nuvio.composeapp.generated.resources.settings_continue_watching_order_resume_first_desc
 import nuvio.composeapp.generated.resources.settings_continue_watching_click_action_description
 import nuvio.composeapp.generated.resources.settings_continue_watching_click_action_details
 import nuvio.composeapp.generated.resources.settings_continue_watching_click_action_details_desc
@@ -91,6 +95,7 @@ internal fun LazyListScope.continueWatchingSettingsContent(
     splitByType: Boolean,
     showResumePromptOnLaunch: Boolean,
     sortMode: ContinueWatchingSortMode,
+    resumeFirst: Boolean,
     clickAction: ContinueWatchingClickAction,
 ) {
     item {
@@ -216,8 +221,10 @@ internal fun LazyListScope.continueWatchingSettingsContent(
         ) {
             SettingsGroup(isTablet = isTablet) {
                 val currentModeLabel = stringResource(
-                    when (sortMode) {
-                        ContinueWatchingSortMode.DEFAULT -> Res.string.settings_continue_watching_sort_mode_default
+                    if (resumeFirst) {
+                        Res.string.settings_continue_watching_order_resume_first
+                    } else when (sortMode) {
+                        ContinueWatchingSortMode.DEFAULT -> Res.string.settings_continue_watching_order_recent
                         ContinueWatchingSortMode.STREAMING_STYLE -> Res.string.settings_continue_watching_sort_mode_streaming
                         ContinueWatchingSortMode.SPLIT_UPCOMING -> Res.string.settings_continue_watching_sort_mode_split_upcoming
                     }
@@ -234,6 +241,11 @@ internal fun LazyListScope.continueWatchingSettingsContent(
         if (showSortModeSheet) {
             ContinueWatchingSortModeDialog(
                 currentMode = sortMode,
+                resumeFirst = resumeFirst,
+                onResumeFirstSelected = {
+                    ContinueWatchingPreferencesRepository.setResumeFirst()
+                    showSortModeSheet = false
+                },
                 onModeSelected = { mode ->
                     ContinueWatchingPreferencesRepository.setSortMode(mode)
                     showSortModeSheet = false
@@ -395,14 +407,16 @@ private fun ContinueWatchingClickActionDialog(
 @Composable
 private fun ContinueWatchingSortModeDialog(
     currentMode: ContinueWatchingSortMode,
+    resumeFirst: Boolean,
+    onResumeFirstSelected: () -> Unit,
     onModeSelected: (ContinueWatchingSortMode) -> Unit,
     onDismiss: () -> Unit,
 ) {
     val options = listOf(
         Triple(
             ContinueWatchingSortMode.DEFAULT,
-            Res.string.settings_continue_watching_sort_mode_default,
-            Res.string.settings_continue_watching_sort_mode_default_desc,
+            Res.string.settings_continue_watching_order_recent,
+            Res.string.settings_continue_watching_order_recent_desc,
         ),
         Triple(
             ContinueWatchingSortMode.STREAMING_STYLE,
@@ -424,8 +438,14 @@ private fun ContinueWatchingSortModeDialog(
             modifier = Modifier.fillMaxWidth(),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
+            DialogOption(
+                text = stringResource(Res.string.settings_continue_watching_order_resume_first),
+                description = stringResource(Res.string.settings_continue_watching_order_resume_first_desc),
+                selected = resumeFirst,
+                onClick = onResumeFirstSelected,
+            )
             options.forEach { (mode, titleRes, descriptionRes) ->
-                val isSelected = mode == currentMode
+                val isSelected = !resumeFirst && mode == currentMode
                 DialogOption(
                     text = stringResource(titleRes),
                     description = stringResource(descriptionRes),
