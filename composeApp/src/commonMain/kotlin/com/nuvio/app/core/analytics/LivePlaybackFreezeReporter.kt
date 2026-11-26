@@ -18,6 +18,9 @@ package com.nuvio.app.core.analytics
  */
 class LivePlaybackFreezeReporter(
     private val capture: (String, Map<String, Any>) -> Unit = com.nuvio.app.core.telemetry.api.TelemetryAccess::emit,
+    /** Stall counts for `session_health` (`stall:live:<outcome>`, `stall_ms:live:<bucket>`): never an event, never rate-capped. */
+    private val recordPlayback: (com.nuvio.app.core.telemetry.api.PlaybackSignal) -> Unit =
+        { runCatching { com.nuvio.app.core.telemetry.api.TelemetryAccess.current().recordPlayback(it) } },
 ) {
 
     /** Playback-time context that is fixed for the channel; captured once when it starts. */
@@ -333,6 +336,20 @@ class LivePlaybackFreezeReporter(
     ) {
         val activeProfile = profile ?: return
         val kind = freezeKind ?: return
+        // Counted before the event's own rate cap: the cap protects event volume, a count is one integer. A freeze still
+        // open when the viewer leaves or zaps away (neither recovered nor gave up) is `abandoned`, the most frustrating case.
+        val stallOutcome = when {
+            recovered -> com.nuvio.app.core.telemetry.api.StallOutcome.RECOVERED
+            gaveUp -> com.nuvio.app.core.telemetry.api.StallOutcome.GAVE_UP
+            else -> com.nuvio.app.core.telemetry.api.StallOutcome.ABANDONED
+        }
+        recordPlayback(
+            com.nuvio.app.core.telemetry.api.PlaybackSignal.Stall(
+                com.nuvio.app.core.telemetry.api.PlaybackKind.LIVE,
+                stallOutcome,
+                (nowMs - freezeStartedAtMs).coerceAtLeast(0L),
+            ),
+        )
         if (!allowEmit(nowMs)) return
 
         val properties = buildMap<String, Any> {
